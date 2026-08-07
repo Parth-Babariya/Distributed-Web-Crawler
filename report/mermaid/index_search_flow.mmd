@@ -1,0 +1,39 @@
+flowchart LR
+    Worker["crawler-worker<br/>storage.flush_batch (txn)"]
+    IndexOutbox[("index_outbox")]
+    GraphOutbox[("graph_outbox")]
+    Docs[("pages_documents<br/>clean text")]
+
+    StreamIdx["streaming-indexer<br/>claim_event() -> process_event()<br/>tokenize + stem"]
+    Postings[("term_postings<br/>{term, url, term_frequency}")]
+    IndexState[("indexed_documents<br/>per-URL term-count snapshot")]
+
+    PRWorker["pagerank-worker<br/>contribution deltas + residual push"]
+    Edges[("graph_edges<br/>per-source outbound list")]
+    PRNodes[("pagerank_nodes<br/>{rank, residual}")]
+
+    Query["GET /search?q=..."]
+    Tokenize["search_api.tokenize<br/>(same stemmer as indexer)"]
+    Pipeline["MongoDB aggregation:<br/>match -> group/sum tf -> $lookup pagerank -><br/>tf x pagerank -> sort -> limit"]
+    Snippets["bulk fetch top-K texts<br/>build snippets"]
+    Results["JSON response<br/>{url, score, term_score, authority_score, snippet}"]
+
+    Worker -- "in same Mongo txn" --> IndexOutbox
+    Worker -- "in same Mongo txn" --> GraphOutbox
+    Worker -- "in same Mongo txn" --> Docs
+
+    IndexOutbox --> StreamIdx
+    Docs --> StreamIdx
+    StreamIdx --> Postings
+    StreamIdx --> IndexState
+
+    GraphOutbox --> PRWorker
+    PRWorker --> Edges
+    PRWorker --> PRNodes
+
+    Query --> Tokenize --> Pipeline
+    Postings --> Pipeline
+    PRNodes --> Pipeline
+    Pipeline --> Snippets
+    Docs --> Snippets
+    Snippets --> Results

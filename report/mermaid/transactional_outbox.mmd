@@ -1,0 +1,34 @@
+sequenceDiagram
+    autonumber
+    participant W as crawler-worker
+    participant Mongo as MongoDB rs0
+    participant SI as streaming-indexer
+    participant PR as pagerank-worker
+
+    Note over W,Mongo: One MongoDB transaction
+    W->>Mongo: BEGIN TXN
+    W->>Mongo: upsert pages_metadata (url)
+    W->>Mongo: upsert pages_content (blob ptr + links)
+    W->>Mongo: upsert pages_documents (clean text)
+    W->>Mongo: insert index_outbox (status=pending)
+    W->>Mongo: insert graph_outbox (status=pending)
+    W->>Mongo: COMMIT
+    Note over W,Mongo: Either all 5 rows persist,<br/>or none do.
+
+    par Streaming index consumer
+        SI->>Mongo: find_one_and_update<br/>{status:pending} -> processing
+        SI->>Mongo: read pages_documents
+        Note over SI,Mongo: process_event<br/>inside its own txn
+        SI->>Mongo: bulk write term_postings<br/>(delete old, upsert new)
+        SI->>Mongo: upsert indexed_documents
+        SI->>Mongo: mark index_outbox done
+    and Streaming PageRank consumer
+        PR->>Mongo: find_one_and_update<br/>{status:pending} -> processing
+        PR->>Mongo: read graph_edges (prior outlinks)
+        Note over PR,Mongo: contribution deltas<br/>added to pagerank_nodes.residual
+        PR->>Mongo: upsert graph_edges (new outlinks)
+        PR->>Mongo: $inc residuals on targets
+        PR->>Mongo: mark graph_outbox done
+    end
+
+    Note over SI,PR: Stale processing events are<br/>reclaimed after claim_timeout<br/>by either consumer's reclaim_stale.

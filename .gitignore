@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+build/
+dist/
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Virtual environment
+.env
+
+# Pytest
+.pytest_cache/
+
+# Mypy
+.mypy_cache/
+
+# Logs
+*.log
+
+# Docker
+docker-compose.override.yml
+**/tmp/
+
+# Results, reports and generated outputs
+results/
+report/generated_results.tex
+report/main.pdf
+report/figures/
+results/processed/
+results/raw/
+
+# MinIO local data
+minio-data/
+
+# Ignore specific PDF that should not be pushed
+Distributed Web Crawler Project.pdf
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Pytest
+.pytest_cache/
+
+# Raw experiment logs & outputs (hundreds of files, fully regenerable)
+results/raw/
+results/figures/
+
+# LaTeX build artifacts
+report/*.aux
+report/*.fdb_latexmk
+report/*.fls
+report/*.log
+report/*.out
+report/*.toc
+report/texput.log
+report/main.pdf
+
+# Python virtual environment (if you ever add one)
+venv/
+.venv/
+env/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets / env files
+.env
+*.env

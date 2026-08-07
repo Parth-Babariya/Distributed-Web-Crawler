@@ -1,0 +1,44 @@
+flowchart TB
+    subgraph Tier1["Tier 1 - active_domains (LIST, FIFO)"]
+        AD["crawler:active_domains<br/>[example.com, github.com, ...]"]
+    end
+
+    subgraph Guard["Guard - domain_known (SET)"]
+        DK["crawler:domain_known<br/>{example.com, github.com, ...}"]
+    end
+
+    subgraph Tier2["Tier 2 - per-domain frontiers (ZSETs)"]
+        F1["crawler:frontier:example.com<br/>ZSET by priority"]
+        F2["crawler:frontier:github.com<br/>ZSET by priority"]
+        Fn["crawler:frontier:&lt;...&gt;"]
+    end
+
+    EnqLua["enqueue Lua:<br/>1. ZADD frontier:&lt;dom&gt; prio url<br/>2. SADD domain_known dom<br/>3. if SADD == 1: RPUSH active_domains dom"]
+
+    DeqLua["dequeue Lua:<br/>1. domain = LPOP active_domains<br/>2. url = ZPOPMAX frontier:&lt;dom&gt;<br/>3. if ZCARD == 0: SREM domain_known dom"]
+
+    PushBackLua["push_back Lua:<br/>if ZCARD &gt; 0:<br/>  if SADD domain_known dom == 1:<br/>    RPUSH active_domains dom<br/>else:<br/>  SREM domain_known dom"]
+
+    Worker["crawler-worker"]
+    Politeness["politeness.can_crawl_domain(dom)<br/>SET lock:&lt;dom&gt; worker_id NX PX (delay+timeout)"]
+
+    NewLink["new URL extracted from page"]
+    NewLink --> EnqLua
+    EnqLua --> F1
+    EnqLua --> DK
+    EnqLua --> AD
+
+    Worker --> DeqLua
+    DeqLua --> AD
+    DeqLua --> F1
+    DeqLua --> DK
+    DeqLua --> Politeness
+
+    Politeness -- "lock acquired" --> Worker
+    Politeness -- "lock held by other worker" --> ReEnqueue["re-enqueue url + push_back domain"]
+    ReEnqueue --> EnqLua
+    ReEnqueue --> PushBackLua
+
+    Worker -- "after crawl finishes" --> PushBackLua
+    PushBackLua --> AD
+    PushBackLua --> DK

@@ -1,0 +1,44 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial","primaryTextColor":"#102a43","lineColor":"#486581"},"flowchart":{"nodeSpacing":34,"rankSpacing":48,"curve":"basis"}}}%%
+flowchart TB
+    classDef redis fill:#FFF8E1,stroke:#F9A825,color:#4E342E
+    classDef mongo fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C
+    classDef app fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    classDef outbox fill:#E0F7FA,stroke:#00838F,color:#004D40
+
+    subgraph App["Application processes"]
+        Seed["seed helper"]:::app
+        Worker["crawler-worker pool"]:::app
+        Indexer["streaming-indexer pool"]:::app
+        PR["pagerank-worker pool"]:::app
+        API["search-api"]:::app
+    end
+
+    subgraph Redis["Redis keys"]
+        F["frontier keys<br/>active_domains, domain_known,<br/>frontier:&lt;domain&gt;"]:::redis
+        D["dedupe + leases<br/>crawler:bloom,<br/>processing_lease:&lt;url&gt;"]:::redis
+        P["politeness keys<br/>lock:&lt;domain&gt;, robots delay,<br/>crawler:processing"]:::redis
+    end
+
+    subgraph Mongo["MongoDB collections"]
+        Page["page records<br/>pages_metadata,<br/>pages_content,<br/>pages_documents"]:::mongo
+        Out["durable queues<br/>index_outbox,<br/>graph_outbox"]:::outbox
+        Index["search state<br/>term_postings,<br/>indexed_documents"]:::mongo
+        Graph["authority state<br/>graph_edges,<br/>pagerank_nodes"]:::mongo
+    end
+
+    Blob[("MinIO / S3<br/>HTML blobs")]:::mongo
+
+    Seed --> F
+    F --> Worker
+    D <--> Worker
+    P <--> Worker
+    Worker --> Blob
+    Worker --> Page
+    Page --> Out
+    Out --> Indexer
+    Out --> PR
+    Indexer --> Index
+    PR --> Graph
+    Index --> API
+    Graph --> API
+    Page --> API

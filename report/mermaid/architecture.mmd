@@ -1,0 +1,52 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial","primaryTextColor":"#102a43","lineColor":"#486581"},"flowchart":{"nodeSpacing":36,"rankSpacing":58,"curve":"basis"}}}%%
+flowchart LR
+    classDef input fill:#E3F2FD,stroke:#1976D2,color:#0D47A1
+    classDef redis fill:#FFF8E1,stroke:#F9A825,color:#4E342E
+    classDef worker fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    classDef storage fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C
+    classDef stream fill:#E0F7FA,stroke:#00838F,color:#004D40
+    classDef query fill:#FCE4EC,stroke:#C2185B,color:#880E4F
+
+    Seed["Seed URLs<br/>seed_urls.txt"]:::input
+
+    subgraph R["Redis coordination"]
+        Frontier["Two-tier frontier<br/>active_domains + frontier:&lt;domain&gt;"]:::redis
+        Bloom["Bloom dedupe<br/>Lua check-and-set"]:::redis
+        Lease["Processing ledger<br/>URL TTL leases"]:::redis
+        Polite["Robots + politeness<br/>owner-tagged locks"]:::redis
+    end
+
+    Workers["crawler-worker x N<br/>fetch, parse, extract links"]:::worker
+
+    subgraph S["Durable storage"]
+        MinIO[("MinIO / S3<br/>compressed HTML blobs")]:::storage
+        Txn["MongoDB transaction<br/>metadata + content pointer + clean text"]:::storage
+        Outbox["Transactional outboxes<br/>index_outbox + graph_outbox"]:::storage
+    end
+
+    subgraph C["Streaming consumers"]
+        Indexer["streaming-indexer x M<br/>term diff -> term_postings"]:::stream
+        PageRank["pagerank-worker x K<br/>edge deltas + residual push"]:::stream
+    end
+
+    subgraph Q["Serving path"]
+        Search["FastAPI search-api<br/>Mongo aggregation"]:::query
+        User["User / evaluator"]:::query
+    end
+
+    Seed --> Frontier
+    Frontier --> Workers
+    Bloom <--> Workers
+    Lease <--> Workers
+    Polite <--> Workers
+
+    Workers --> MinIO
+    Workers --> Txn
+    Txn --> Outbox
+
+    Outbox --> Indexer
+    Outbox --> PageRank
+    Indexer --> Search
+    PageRank --> Search
+    Txn --> Search
+    Search --> User

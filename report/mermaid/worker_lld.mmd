@@ -1,0 +1,36 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial","primaryTextColor":"#102a43","lineColor":"#486581"},"flowchart":{"nodeSpacing":32,"rankSpacing":44,"curve":"basis"}}}%%
+flowchart TB
+    classDef redis fill:#FFF8E1,stroke:#F9A825,color:#4E342E
+    classDef work fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    classDef io fill:#E3F2FD,stroke:#1976D2,color:#0D47A1
+    classDef fail fill:#FFEBEE,stroke:#C62828,color:#7F0000
+    classDef txn fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C
+
+    Start(["loop start"]):::work
+    Recover["recover expired leases<br/>(bounded by recovery_interval)"]:::redis
+    Pop["dequeue domain + URL<br/>Lua: active_domains -> frontier:&lt;domain&gt;"]:::redis
+    Polite{"domain lock<br/>available?"}:::redis
+    Lease["claim URL lease<br/>processing_lease + crawler:processing"]:::redis
+    Fetch["aiohttp fetch<br/>DNS cache + stable UA per domain"]:::io
+    Verify{"still own<br/>URL lease?"}:::redis
+    Parse["parse HTML<br/>extract clean text + links"]:::work
+    Dedupe["filter links<br/>robots batch + Bloom Lua"]:::redis
+    Blob["write compressed HTML<br/>to MinIO/S3"]:::io
+    Txn["Mongo transaction<br/>metadata, content pointer, document,<br/>index_outbox, graph_outbox"]:::txn
+    Result{"flush result"}:::txn
+    Done["release committed lease<br/>update worker stats"]:::redis
+    Retry["release + re-enqueue<br/>priority decay, retry++"]:::fail
+    Zombie["abort as zombie<br/>do not re-enqueue"]:::fail
+    Sleep["idle / short sleep"]:::work
+
+    Start --> Recover --> Pop
+    Pop -->|no ready URL| Sleep --> Start
+    Pop --> Polite
+    Polite -->|held by another worker| Retry
+    Polite -->|acquired| Lease --> Fetch
+    Fetch -->|non-HTML / timeout / error| Retry
+    Fetch -->|HTML OK| Verify
+    Verify -->|lease lost| Zombie --> Start
+    Verify -->|lease owned| Parse --> Dedupe --> Blob --> Txn --> Result
+    Result -->|committed or duplicate| Done --> Start
+    Result -->|transaction failed| Retry --> Start

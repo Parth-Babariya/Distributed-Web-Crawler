@@ -1,0 +1,31 @@
+flowchart TD
+    Event["graph_outbox event<br/>{source_url, new_outbound_links, crawl_version}"]
+    Claim["pagerank-worker claims event<br/>find_one_and_update -> processing"]
+
+    LoadEdge["load graph_edges[source_url]<br/>old outbound list + last_crawl_version"]
+    StaleCheck{"crawl_version &lt;= last?"}
+    SkipStale["mark event done<br/>skipped_reason=stale_crawl_version"]
+
+    LoadRank["read source rank from pagerank_nodes<br/>(default 1.0 if new node)"]
+    Delta["compute deltas:<br/>for each old link: -d * rank / |old|<br/>for each new link: +d * rank / |new|<br/>(dangling case uses personalization)"]
+    AddResid["$inc residual on each affected node<br/>(in same Mongo txn)"]
+    UpdateEdges["upsert graph_edges<br/>{outbound_urls, last_crawl_version}"]
+    DoneEvent["mark graph_outbox event done"]
+
+    PushLoop{"propagate_residuals loop:<br/>any node with |residual| &gt; epsilon * rank?"}
+    ClaimNode["claim node:<br/>set residual_claimed_at + worker_id"]
+    PushNode["push_residual (in txn):<br/>rank += residual<br/>residual = 0<br/>for each successor:<br/>  $inc residual += d * delta / |succ|"]
+    Stop["no residuals above threshold<br/>(steady state)"]
+
+    Recompute["full_recompute (CLI):<br/>classic power iteration<br/>from graph_edges to convergence"]
+    Reset["overwrite pagerank_nodes<br/>{rank, residual=0}"]
+
+    Event --> Claim --> LoadEdge --> StaleCheck
+    StaleCheck -- yes --> SkipStale --> DoneEvent
+    StaleCheck -- no --> LoadRank --> Delta --> AddResid --> UpdateEdges --> DoneEvent
+
+    DoneEvent --> PushLoop
+    PushLoop -- yes --> ClaimNode --> PushNode --> PushLoop
+    PushLoop -- no --> Stop
+
+    Recompute --> Reset

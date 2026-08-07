@@ -1,0 +1,23 @@
+# Core crawler dependencies
+beautifulsoup4>=4.12
+requests>=2.31
+redis>=5.0
+pymongo>=4.6
+fastapi>=0.124
+uvicorn>=0.38
+
+# Reporting and performance tests
+matplotlib>=3.10
+numpy>=2.3
+pandas>=2.3
+psutil>=7.0
+
+# Test runner used by the README's `pytest -q` command.
+pytest>=8.0
+
+# Optional accelerators. The code has fallbacks if these are unavailable.
+aiohttp>=3.13
+mmh3>=5.0
+
+# Optional S3-compatible HTML blob storage for distributed deployments.
+boto3>=1.35

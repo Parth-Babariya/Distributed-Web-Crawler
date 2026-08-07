@@ -1,0 +1,1131 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xspace}
+\usetikzlibrary{arrows.meta,calc,positioning,shapes.geometric}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+\emergencystretch=3em
+
+\definecolor{codebg}{RGB}{246,248,250}
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{black!30},
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  xleftmargin=8pt,
+  xrightmargin=8pt
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\tightcaption}[1]{\caption{\small #1}}
+
+% Conditional figure include: shows a clear placeholder when the rendered
+% PDF/PNG is missing so the report compiles even before figures are
+% regenerated. See report/REGENERATE.md for how to produce them.
+\newcommand{\rendered}[3]{%
+  \IfFileExists{#1}{%
+    \includegraphics[width=#2\textwidth,height=0.72\textheight,keepaspectratio]{#1}%
+  }{%
+    \fbox{\parbox{#2\textwidth}{\centering\small\textit{[Figure not yet rendered:\ \texttt{#1}]\\#3}}}%
+  }%
+}
+
+% Convenience: a labelled placeholder for a results table that needs
+% regeneration. Compile-safe — produces a clearly-marked stub.
+\newcommand{\regenerateTable}[1]{%
+  \begin{center}\fbox{\parbox{0.92\textwidth}{\small\textbf{Regenerate required.} #1\\See \texttt{report/REGENERATE.md}.}}\end{center}
+}
+
+\begin{document}
+\pagenumbering{gobble}
+
+\begin{titlepage}
+\centering
+\vspace*{2.2cm}
+{\LARGE \textbf{Distributed Web Crawler}\\[0.3cm]
+\large with Streaming Indexing, Incremental PageRank \& Search API\par}
+\vspace{0.5cm}
+{\large Project Report for the Course:\par}
+{\large \textbf{Distributed Systems}\par}
+\vspace{1.5cm}
+{\large Submitted By:\par}
+\vspace{0.3cm}
+{\large Vaibhav Gupta\par}
+{\large 2024201044\par}
+\vspace{0.25cm}
+{\large Sayam Agarwal\par}
+{\large 2024201025\par}
+\vspace{0.25cm}
+{\large Aaditya\par}
+{\large 2019113009\par}
+\vfill
+{\large International Institute of Information Technology\\(IIIT Hyderabad)\par}
+\vspace{0.5cm}
+{\large May 2026\par}
+\end{titlepage}
+
+\pagenumbering{roman}
+\tableofcontents
+\newpage
+\pagenumbering{arabic}
+
+%% ===================================================================
+\section{Introduction}
+%% ===================================================================
+
+A web crawler must concurrently fetch, parse, persist, and index large numbers of web pages while honouring per-domain rate limits, recovering from worker failures, and serving low-latency search queries against the indexed corpus. A single-process crawler is straightforward but is a single point of failure and cannot scale beyond the throughput of one host. This project implements a fully decentralized distributed crawler in which independently-running worker, indexer, and PageRank processes coordinate purely through shared infrastructure (Redis, MongoDB, MinIO/S3) with no master in the hot path.
+
+The implemented pipeline:
+
+\begin{center}
+\code{seed URLs $\to$ Redis two-tier frontier $\to$ crawler workers $\to$ MinIO blobs + Mongo (txn) $\to$ index\_outbox / graph\_outbox $\to$ streaming indexer + PageRank worker $\to$ FastAPI search}
+\end{center}
+
+The system stresses three distributed-systems properties beyond what a textbook crawler usually demonstrates:
+
+\begin{enumerate}
+  \item \textbf{Atomic coordination through Lua scripts.} The two-tier frontier (active-domains LIST + per-domain ZSETs + coherence SET), the Bloom-filter check-and-set, the per-URL processing lease, and the politeness lock are all exposed through Lua scripts that run atomically inside Redis. This eliminates the producer/consumer races that a check-then-act Python sequence would introduce under multiple workers.
+  \item \textbf{Transactional outbox.} A page write inserts page metadata, content pointer, clean text, and two outbox events (\code{index\_outbox}, \code{graph\_outbox}) inside a single MongoDB multi-document transaction. The streaming indexer and PageRank worker consume those outbox events with a claim/process/done lifecycle and a stale-event reclaim watchdog. This guarantees that no event is ever orphaned from its page write and no event is ever silently lost when a downstream consumer is offline.
+  \item \textbf{Incremental PageRank with residual push.} The PageRank worker maintains \code{pagerank\_nodes} live: each page-arrival event computes per-edge contribution deltas, accumulates them as residuals on affected nodes, and pushes those residuals through successors with damping until they fall below an $\varepsilon$ threshold. A converged power-iteration recompute is available as a fallback. Search ranking blends term frequency with this maintained authority score in a single MongoDB aggregation pipeline.
+\end{enumerate}
+
+Every architectural choice in this report is implemented in code under \code{src/}; every experimental result is generated by scripts under \code{scripts/} against a Docker Compose stack; and every figure is generated from a CSV/JSON in \code{results/processed/}. When the empirical sections below show a regeneration placeholder, see \code{report/REGENERATE.md} for the exact command sequence.
+
+\subsection{System Goals}
+
+\begin{itemize}
+  \item \textbf{Scalability:} workers, streaming indexers, and PageRank workers each scale horizontally and independently through Docker Compose replica counts.
+  \item \textbf{No single point of failure in the hot path:} the master is monitoring-only; all crawl coordination is decentralized through Redis and MongoDB.
+  \item \textbf{Distributed correctness without clock comparison:} per-URL processing leases, per-domain politeness locks, and outbox event claims all use server-side TTLs --- worker host clocks are never compared.
+  \item \textbf{Memory-efficient deduplication:} a Lua-atomic Bloom filter sized for $10^7$ URLs at $10^{-3}$ false-positive rate occupies $\approx 17$~MB of Redis memory.
+  \item \textbf{Politeness:} per-domain locks with owner-tagged release; \code{robots.txt} is fetched concurrently and cached in Redis.
+  \item \textbf{Persistence:} page metadata, blob pointers, and clean text are written transactionally; raw compressed HTML lives in MinIO/S3, not in MongoDB's WiredTiger cache.
+  \item \textbf{Streaming search updates:} a page becomes searchable as soon as the streaming indexer drains its \code{index\_outbox} event --- no batch rebuild required.
+  \item \textbf{Authority-aware ranking:} the PageRank worker maintains \code{pagerank\_nodes} live; the search API blends \(\sum tf\) with PageRank inside one Mongo aggregation.
+  \item \textbf{Fault tolerance:} crashed crawler workers are recovered through native Redis lease expiry; crashed streaming consumers are recovered through claim-timeout reclaim; partial Mongo failures abort the page transaction so no outbox event is orphaned.
+  \item \textbf{Observability:} per-worker statistics, MongoDB aggregation snapshots, and persisted distributed-test evidence under \code{results/}.
+\end{itemize}
+
+%% ===================================================================
+\section{Architectural Patterns and Decision Records}
+%% ===================================================================
+
+\subsection{Decentralized Master-Worker}
+
+\textbf{Pattern.} Master-worker with a degenerate master.\\
+\textbf{Implementation.} \code{src/v3/master\_v3.py} only seeds the frontier and reports monitoring statistics; \code{src/v3/worker\_v3.py} performs the entire crawl loop autonomously.\\
+\textbf{Why.} A central scheduler is the easiest path to a deadlock or a hot CPU on the coordinator. Workers self-coordinate through Redis structures (frontier, Bloom, processing ledger, politeness locks); MasterV3 can be killed and restarted without affecting an in-progress crawl.
+
+\subsection{Shared-Nothing Workers}
+
+\textbf{Pattern.} Workers share no in-process state with each other.\\
+\textbf{Implementation.} Each \code{DecentralizedWorker} owns its own \code{requests}/\code{aiohttp} sessions, its own \code{ProcessingLedger}, its own \code{Frontier} client, its own \code{PolitenessManager}, and its own \code{OptimizedStorage}. Coordination is entirely through shared backends.\\
+\textbf{Why.} Horizontal scalability across hosts; a worker's death does not corrupt another worker's state; Docker Compose can scale workers with \code{docker compose up --scale crawler-worker=N}.
+
+\subsection{Two-Tier URL Frontier (Mercator / Heritrix)}
+
+\textbf{Pattern.} Tier-1 list of \emph{domains} that have ready work; tier-2 ZSET of \emph{URLs} per domain.\\
+\textbf{Implementation.} \code{src/v3/frontier.py}; three Redis Lua scripts (\code{enqueue}, \code{dequeue}, \code{push\_back}) keep the LIST/SET/ZSET trio coherent.\\
+\textbf{Why.} A single global ZSET turns domain politeness into a busy-wait: workers pop URLs they cannot crawl and re-queue them with priority decay. The two-tier design pops a \emph{domain} first, checks politeness, and only then dequeues a URL --- so no URL ever leaves its queue without its lock being held.
+
+\subsection{Probabilistic URL Deduplication}
+
+\textbf{Pattern.} Redis-backed Bloom filter with atomic Lua check-and-set.\\
+\textbf{Implementation.} \code{src/v3/bloom\_filter.py}; Lua script reads bits and writes bits in a single server-side execution.\\
+\textbf{Why.} An exact set for $10^7$ URLs would cost $\approx 1.2$~GB of Redis memory. The Bloom filter brings this down to $\approx 17$~MB at the cost of a 0.1\% false-positive rate. The atomic Lua script prevents the previous race window in which two workers could both observe ``new'' on the same URL.
+
+\subsection{Per-URL Processing Leases}
+
+\textbf{Pattern.} Lease key with native Redis TTL; index hash for enumeration.\\
+\textbf{Implementation.} \code{src/v3/processing\_ledger.py}; Lua scripts for \code{claim}, \code{release}, \code{renew}, and a Lua-checked recovery sweep.\\
+\textbf{Why.} Comparing the local clock of one worker against another worker's \code{time.time()} value to detect stale URLs is unreliable because worker hosts drift. Native Redis TTLs are server-side; no clock comparison.
+
+\subsection{Owner-Tagged Politeness Locks}
+
+\textbf{Pattern.} The lock value is the worker ID. Only the owner may shrink the lock to the post-fetch cooldown.\\
+\textbf{Implementation.} \code{src/v3/politeness.py}; \code{can\_crawl\_domain} acquires with \code{SET NX PX}, value = worker ID; \code{release\_after\_crawl\_domain} runs a Lua \code{GET-compare-PSETEX}.\\
+\textbf{Why.} The previous design set the lock TTL to just the crawl-delay; a slow download outlived its lock and a second worker could open a concurrent connection to the same server. The new design sets TTL = $\textit{crawl\_delay} + \textit{max\_request\_timeout}$ during the fetch, then shrinks back to crawl\_delay only if we still own the lock.
+
+\subsection{Transactional Outbox}
+
+\textbf{Pattern.} Outbox events written in the same MongoDB transaction as the data row that produced them.\\
+\textbf{Implementation.} \code{src/v3/optimized\_storage.py:\_flush\_transactional}; one transaction inserts \code{pages\_metadata}, \code{pages\_content}, \code{pages\_documents}, \code{index\_outbox}, and \code{graph\_outbox}.\\
+\textbf{Why.} Without transactional outbox, a network blip between writing the page and notifying downstream consumers leaves the system inconsistent: either pages exist with no index event, or events fire for pages that never persisted. With it, either all five rows commit or none do.
+
+\subsection{Externalised Blob Storage}
+
+\textbf{Pattern.} MongoDB stores only a pointer; raw compressed HTML lives in an S3-compatible object store (MinIO locally, S3 in production).\\
+\textbf{Implementation.} \code{src/v3/optimized\_storage.py:LocalHtmlBlobStore} and \code{S3HtmlBlobStore} behind a uniform interface.\\
+\textbf{Why.} MongoDB's WiredTiger cache is sized for working-set queries on metadata and the inverted index. Stuffing megabyte-sized HTML blobs into Mongo evicts hot metadata documents and degrades query latency. MinIO/S3 keeps the blobs in a system that is designed to serve them.
+
+\subsection{Streaming Index with Per-URL State}
+
+\textbf{Pattern.} Per-URL term-count snapshot drives correct re-indexing on recrawls.\\
+\textbf{Implementation.} \code{src/indexer/streaming\_indexer.py}; \code{indexed\_documents} stores \code{\{url, term\_counts, last\_indexed\_version\}}, used to compute exactly which postings to delete and which to upsert.\\
+\textbf{Why.} A naive ``add postings for new tokens'' indexer accumulates stale postings forever when the same URL is re-crawled with different content. Snapshotting per-URL state lets us compute the precise diff.
+
+\subsection{Normalized Term Postings (No Embedded Arrays)}
+
+\textbf{Pattern.} One MongoDB document per \code{(term, url)} pair instead of one document per term with an embedded postings array.\\
+\textbf{Implementation.} \code{term\_postings} collection; compound unique index on \code{(term, url)}.\\
+\textbf{Why.} The legacy embedded-array layout hits MongoDB's 16~MB BSON document limit on common English terms (\textit{the}, \textit{page}, \textit{data}) in any real-world crawl. The normalized layout has no per-term size cap; the search aggregation runs equally well on it.
+
+\subsection{Incremental PageRank with Residual Push}
+
+\textbf{Pattern.} Edge changes produce contribution deltas; deltas accumulate as residuals; residuals propagate through successors until they fall below $\varepsilon$.\\
+\textbf{Implementation.} \code{src/indexer/pagerank\_worker.py}; per-event delta computation in one Mongo transaction; separate residual-push loop with reclaimable claims; \code{full\_recompute} subcommand for converged power iteration.\\
+\textbf{Why.} A live crawl produces continuous graph mutations. Running classic power iteration after every page is intractable; running it on a schedule gives stale results between runs. Residual push maintains an approximate live PageRank with deterministic convergence semantics ($\varepsilon$-bounded error per push).
+
+\subsection{Decision Records}
+
+\begin{table}[H]
+\centering
+\caption{Architectural decision records for the implemented system}
+\begin{tabular}{p{0.05\textwidth}p{0.32\textwidth}p{0.55\textwidth}}
+\toprule
+ADR & Decision & Rationale \\
+\midrule
+1 & Two-tier domain frontier with Lua scripts & Eliminates the busy-wait of single-ZSET re-queue and keeps SET/LIST/ZSET coherent under many writers.\\
+2 & Bloom filter via Lua check-and-set & Closes the TOCTOU race that allowed two workers to both treat the same URL as new.\\
+3 & Per-URL processing leases with Redis-native TTL & Eliminates cross-machine clock comparison; stale recovery is bounded by lease expiry, not by worker liveness checks.\\
+4 & Owner-tagged politeness locks (TTL covers fetch + cooldown) & Prevents a slow download from outliving its lock; prevents a stalled worker from shortening another worker's newer lock.\\
+5 & MongoDB multi-document transaction for page+outbox writes & Either all rows commit or none; no orphaned outbox events.\\
+6 & MinIO/S3 for HTML blobs, Mongo for pointers & Keeps WiredTiger cache aligned with hot metadata/index queries; allows shared blob storage across containers.\\
+7 & \code{term\_postings} (one doc per term-url) replaces embedded-array \code{inverted\_index} & Avoids the 16~MB BSON cap; supports the same aggregation-based search ranking.\\
+8 & Streaming indexer + per-URL state snapshot & Pages become searchable in seconds, not minutes; recrawls remove stale postings precisely.\\
+9 & Incremental PageRank via residual push, with power-iteration recompute fallback & Live authority scores without per-event $O(N)$ recompute; deterministic $\varepsilon$ bound.\\
+10 & FastAPI search-api with database-side ranking & Sort/limit happen inside Mongo aggregation; FastAPI never holds full posting lists in RAM.\\
+11 & Single-node Mongo replica set in Compose & Smallest deployable configuration that supports multi-document transactions.\\
+12 & Owner-tagged claims in outbox consumers & Streaming indexer and PageRank worker can scale horizontally without overlap; stale claims expire and are returned to \code{pending}.\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ===================================================================
+\section{High-Level Design}
+%% ===================================================================
+
+\subsection{Process Topology}
+
+The system runs four classes of long-lived processes plus an on-demand seeder, all coordinated through Redis, MongoDB, and MinIO/S3.
+
+\begin{table}[H]
+\centering
+\caption{Long-lived processes and their roles}
+\begin{tabular}{p{0.22\textwidth}p{0.22\textwidth}p{0.50\textwidth}}
+\toprule
+Service & Source & Role \\
+\midrule
+\code{crawler-worker} & \code{src/v3/worker\_v3.py} & Fetch pages, parse links, write blobs to MinIO, write pages and outbox events to Mongo in one transaction.\\
+\code{streaming-indexer} & \code{src/indexer/streaming\_indexer.py} & Consume \code{index\_outbox}, update \code{term\_postings} and \code{indexed\_documents}.\\
+\code{pagerank-worker} & \code{src/indexer/pagerank\_worker.py} & Consume \code{graph\_outbox}, update \code{graph\_edges}, push residuals through \code{pagerank\_nodes}.\\
+\code{search-api} & \code{src/search/search\_api.py} & FastAPI service; ranks via Mongo aggregation that joins \code{term\_postings} with \code{pagerank\_nodes}.\\
+\code{seed} (one-shot) & \code{scripts/seed\_from\_file.py} & Loads \code{seed\_urls.txt} into the two-tier frontier.\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/architecture.pdf}{0.96}{System architecture: seeder, Redis coordination, crawler workers, MinIO blob store, MongoDB transactional outbox, streaming indexer, PageRank worker, search API. Render \texttt{report/mermaid/architecture.mmd} with mmdc.}
+\caption{System architecture (renders from \code{report/mermaid/architecture.mmd}).}
+\label{fig:architecture}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/hld.pdf}{0.96}{High-level design with all Redis keys and MongoDB collections labelled. Render \texttt{report/mermaid/hld.mmd} with mmdc.}
+\caption{HLD: Redis coordination keys, MongoDB collections, streaming pipeline.}
+\label{fig:hld}
+\end{figure}
+
+\subsection{Coordination Layer (Redis)}
+
+\begin{table}[H]
+\centering
+\caption{Redis data structures used by the crawler and consumers}
+\begin{tabular}{p{0.34\textwidth}p{0.10\textwidth}p{0.48\textwidth}}
+\toprule
+Key & Type & Purpose \\
+\midrule
+\code{crawler:active\_domains} & LIST & Tier 1 of two-tier frontier: FIFO queue of domains with ready URLs.\\
+\code{crawler:domain\_known} & SET & Coherence guard: prevents the same domain being pushed twice into \code{active\_domains}.\\
+\code{crawler:frontier:<domain>} & ZSET & Tier 2 of two-tier frontier: per-domain priority queue of URL JSON blobs.\\
+\code{crawler:bloom} & STRING (bitmap) & Bloom-filter bit array; check-and-set via Lua.\\
+\code{processing\_lease:<url>} & STRING & Per-URL lease, value = worker ID, native PEXPIRE.\\
+\code{crawler:processing} & HASH & Enumerable index of in-flight URLs (url $\to$ url\_data JSON).\\
+\code{lock:<domain>} & STRING & Owner-tagged politeness lock; value = worker ID.\\
+\code{crawler:robots:delay:<domain>} & STRING & Cached \code{Crawl-delay} value parsed from robots.txt.\\
+\code{robots\_cache:<domain>} & HASH & Cached robots.txt contents (TTL 24h).\\
+\code{crawler:shutdown} & STRING & Cooperative shutdown signal.\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Storage Layer (MongoDB)}
+
+The crawler writes five collections inside one transaction; downstream workers consume two outbox collections and maintain four state collections.
+
+\begin{table}[H]
+\centering
+\caption{MongoDB collections}
+\begin{tabular}{p{0.22\textwidth}p{0.22\textwidth}p{0.50\textwidth}}
+\toprule
+Collection & Written by & Purpose \\
+\midrule
+\code{pages\_metadata} & crawler-worker & URL identity, domain, title, content hash, sizes, crawl version, crawl timestamps.\\
+\code{pages\_content} & crawler-worker & Pointer to blob in MinIO/S3, outbound links, content hash.\\
+\code{pages\_documents} & crawler-worker & Clean extracted text used by streaming indexer and snippets.\\
+\code{index\_outbox} & crawler-worker & Pending index events: \code{\{url, page\_id, crawl\_version, status\}}.\\
+\code{graph\_outbox} & crawler-worker & Pending graph events: \code{\{source\_url, new\_outbound\_links, crawl\_version, status\}}.\\
+\code{term\_postings} & streaming-indexer & One document per \code{(term, url)} pair; the live search index.\\
+\code{indexed\_documents} & streaming-indexer & Per-URL term-count snapshot used to compute precise re-indexing diffs on recrawl.\\
+\code{graph\_edges} & pagerank-worker & Historical outbound-link ledger per source URL.\\
+\code{pagerank\_nodes} & pagerank-worker & Live PageRank scoreboard: \code{\{url, rank, residual, last\_updated\}}.\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Object Storage (MinIO / S3)}
+
+Compressed HTML payloads are written to a content-addressed key derived from the SHA-256 hash:
+
+\begin{lstlisting}
+html/<hash[0:2]>/<hash[2:4]>/<hash>.zlib
+\end{lstlisting}
+
+This achieves three things: (i) deduplicated storage --- byte-identical pages across mirrors collapse to one object; (ii) flat per-shard distribution --- the two-byte prefix gives a near-uniform spread across $256 \times 256$ prefixes; (iii) shared access --- every container reads from the same bucket regardless of which worker did the original fetch.
+
+\subsection{Asynchronous Decoupling}
+
+The crawler writes pages and \emph{outbox events}; it never blocks on indexing or PageRank. The streaming indexer and PageRank worker drain those events asynchronously. Each subsystem can scale, restart, or backlog independently:
+
+\begin{itemize}
+  \item Add more crawler workers $\to$ pages arrive faster $\to$ outboxes grow $\to$ indexer/PageRank workers eventually catch up.
+  \item Stop the indexer for an hour $\to$ pages still get crawled and stored; \code{index\_outbox} grows; on restart the indexer drains it.
+  \item Stop crawling $\to$ search remains live; PageRank quiesces (no new graph events) but its previously-computed scores remain available.
+\end{itemize}
+
+%% ===================================================================
+\section{Low-Level Design}
+%% ===================================================================
+
+\subsection{Two-Tier URL Frontier}
+\label{sec:frontier}
+
+The frontier is the most subtle piece of distributed coordination in the system. It is split across three Redis structures that must remain coherent under many concurrent writers.
+
+\begin{figure}[H]
+\centering
+\rendered{figures/two_tier_frontier.pdf}{0.94}{Tier-1 \texttt{active\_domains} LIST + tier-2 per-domain ZSETs + \texttt{domain\_known} SET coherence guard. Render \texttt{report/mermaid/two\_tier\_frontier.mmd}.}
+\caption{Two-tier frontier with Lua-atomic enqueue, dequeue, and push-back.}
+\label{fig:two-tier}
+\end{figure}
+
+\subsubsection{The Coherence Problem}
+
+Three structures must agree:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{crawler:active\_domains} (LIST) --- domains with at least one ready URL, in round-robin order.
+  \item \code{crawler:domain\_known} (SET) --- guards against double-pushing the same domain.
+  \item \code{crawler:frontier:<domain>} (ZSET) --- the actual URL queue for one domain.
+\end{itemize}
+
+If a Python sequence enqueues by writing to the ZSET, then reading the SET, then deciding whether to push to the LIST, two concurrent enqueues for a previously-unknown domain can both push the domain into the LIST. Conversely, if a Python sequence dequeues a domain, then reads the ZSET, then conditionally removes the SET membership, an enqueue arriving between the read and the remove can leave the SET claiming the domain is known while the LIST does not contain it.
+
+\subsubsection{Lua Scripts}
+
+The fix is to express each state transition as a Lua script. Redis runs Lua atomically: no other command interleaves between any two Redis calls inside one script.
+
+\textbf{Enqueue:}
+
+\begin{lstlisting}
+-- KEYS[1]=frontier:<dom>  KEYS[2]=domain_known  KEYS[3]=active_domains
+-- ARGV[1]=dom             ARGV[2]=priority      ARGV[3]=url_json
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+if redis.call('SADD', KEYS[2], ARGV[1]) == 1 then
+    redis.call('RPUSH', KEYS[3], ARGV[1])
+    return 1
+end
+return 0
+\end{lstlisting}
+
+\textbf{Dequeue:}
+
+\begin{lstlisting}
+-- KEYS[1]=active_domains  KEYS[2]=domain_known  ARGV[1]=frontier prefix
+local domain = redis.call('LPOP', KEYS[1])
+if not domain then return nil end
+local fkey = ARGV[1] .. domain
+local result = redis.call('ZPOPMAX', fkey, 1)
+if #result == 0 then
+    redis.call('SREM', KEYS[2], domain)
+    return {domain, false, false}  -- stale entry, retry
+end
+local remaining = redis.call('ZCARD', fkey)
+if remaining == 0 then
+    redis.call('SREM', KEYS[2], domain)
+end
+return {domain, result[1], result[2]}
+\end{lstlisting}
+
+\textbf{Push-back} (called when the worker is done with one URL of a domain): re-adds the domain to \code{active\_domains} only if the per-domain ZSET still has URLs, preserving the SADD-then-RPUSH idempotence.
+
+\subsubsection{Worker Loop Around the Frontier}
+
+The worker calls \code{frontier.dequeue()} which returns \code{(domain, url\_json, priority)}. Before doing anything with the URL, the worker calls \code{politeness.can\_crawl\_domain(domain, crawl\_delay)}. If the lock is held by another worker, the URL is re-enqueued and the domain is pushed back to the tail of \code{active\_domains}. Notice that under the two-tier design, a busy domain only causes one worker to bounce; URLs never leave their per-domain queue without their politeness lock being held.
+
+\subsection{Bloom Filter (Lua-Atomic)}
+\label{sec:bloom}
+
+The Bloom filter shares one Redis bitmap across all workers. The previous implementation pipelined GETBIT then pipelined SETBIT in two round trips --- two workers racing on the same URL could both observe ``new'' between the two pipelines.
+
+\textbf{Lua-atomic add:}
+
+\begin{lstlisting}
+-- KEYS[1]=bloom bitmap   ARGV=bit positions
+local was_new = 0
+for i = 1, #ARGV do
+    if redis.call('GETBIT', KEYS[1], ARGV[i]) == 0 then
+        was_new = 1
+    end
+    redis.call('SETBIT', KEYS[1], ARGV[i], 1)
+end
+return was_new
+\end{lstlisting}
+
+\code{add\_many(urls)} pipelines one Lua call per URL so a page's worth of extracted links costs one network round trip but each per-URL atomicity is preserved.
+
+\paragraph{Sizing.} For target capacity $n=10^7$ and false-positive rate $p=10^{-3}$:
+\begin{equation}
+m = -\frac{n \ln p}{(\ln 2)^2} = 143{,}775{,}875 \text{ bits} \approx 17.14~\text{MB}
+\end{equation}
+\begin{equation}
+k = \frac{m}{n} \ln 2 \approx 9.97
+\end{equation}
+The implementation uses 9 hash functions (MurmurHash3 with seeds 0--8; \code{blake2b} fallback when \code{mmh3} is unavailable).
+
+\subsection{Per-URL Processing Ledger}
+\label{sec:ledger}
+
+The processing ledger tracks which URLs are in flight and which worker owns each one. The previous design wrote \code{time.time()} into a single hash; recovery compared that timestamp against the local clock of any worker that ran the recovery sweep. Cross-machine clock drift broke this: a healthy worker's URL would be reclassified as stale by another worker with a fast clock, causing duplicate fetches.
+
+\subsubsection{Ledger Structures}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{processing\_lease:<url>} --- STRING, value = worker ID, with native \code{PEXPIRE} TTL. Server-side; no clock comparison.
+  \item \code{crawler:processing} --- HASH used purely as an enumerable index for the recovery sweep.
+\end{itemize}
+
+\subsubsection{Atomic Operations}
+
+\textbf{Claim:}
+
+\begin{lstlisting}
+-- KEYS[1]=processing_lease:<url>   KEYS[2]=crawler:processing
+-- ARGV[1]=url   ARGV[2]=worker_id   ARGV[3]=url_data_json   ARGV[4]=ttl_ms
+redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[4])
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
+return 1
+\end{lstlisting}
+
+\textbf{Release} (atomic GET-compare-DEL):
+
+\begin{lstlisting}
+local owner = redis.call('GET', KEYS[1])
+if owner == ARGV[2] then
+    redis.call('DEL', KEYS[1])
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    return 1   -- we owned the lease; cleaned up
+end
+return 0       -- displaced (zombie); caller must abort
+\end{lstlisting}
+
+\textbf{Verify owner.} A worker calls \code{ledger.verify\_owner(url, worker\_id)} after a long-running fetch but before any irreversible side-effect (Mongo write, link extraction). If \code{False}, the worker has been displaced --- the lease expired during the fetch and a recovery sweep has reassigned the URL to another worker. The worker must abort before producing duplicate data.
+
+\textbf{Recovery sweep.} \code{recover\_stale()} HSCANs \code{crawler:processing}, batches EXISTS checks for \code{processing\_lease:<url>}, and re-enqueues entries whose lease has expired. The sweep is throttled to once per \code{recovery\_interval} (default 10s) per worker --- the lease itself enforces freshness, not the sweep frequency.
+
+\begin{figure}[H]
+\centering
+\rendered{figures/processing_ledger.pdf}{0.92}{Lease lifecycle: Unclaimed $\to$ Claimed $\to$ \{Released, Zombie, Expired$\to$Recovered\}. Render \texttt{report/mermaid/processing\_ledger.mmd}.}
+\caption{ProcessingLedger lease state machine.}
+\label{fig:ledger}
+\end{figure}
+
+\subsection{Owner-Tagged Politeness Manager}
+\label{sec:politeness}
+
+The politeness manager exposes \code{can\_crawl\_domain} and \code{release\_after\_crawl\_domain}. Two design choices guard against subtle distributed races.
+
+\subsubsection{Lock TTL Covers Fetch Time, Then Shrinks}
+
+A naive politeness lock has TTL = $\textit{crawl\_delay}$ (e.g.\ 100ms). If a real download takes 5 seconds, the lock evaporates four times during the fetch and another worker can open a concurrent connection to the target server, breaking politeness and risking IP bans.
+
+The implemented lock acquires with TTL = $\textit{crawl\_delay} + \textit{max\_request\_timeout}$ (e.g.\ 0.1 + 15 = 15.1s). When the fetch completes, the worker calls \code{release\_after\_crawl\_domain} which atomically shrinks the lock back to just \code{crawl\_delay} so the cooldown clock starts from connection-close, not connection-open.
+
+\subsubsection{Owner Verification on Release}
+
+A stalled worker that wakes up after another worker has acquired a fresh lock must not shrink that other worker's lock. The release Lua script:
+
+\begin{lstlisting}
+local owner = redis.call('GET', KEYS[1])
+if owner == ARGV[1] or not owner then
+    redis.call('PSETEX', KEYS[1], ARGV[2], ARGV[1])
+    return 1
+end
+return 0
+\end{lstlisting}
+
+We accept ``no owner'' (the lock fully expired during the fetch, which shouldn't happen under correct \code{max\_request\_timeout} sizing) but reject ``different owner'' (someone else acquired the lock while we were stalled).
+
+\subsubsection{Domain Identifier Consistency}
+
+\code{politeness.\_extract\_domain}, \code{frontier.extract\_domain}, and \code{worker.\_extract\_domain} all return the same lowercased \code{netloc}. This guarantees that the lock key, the frontier key, and the metadata \code{domain} field all agree --- otherwise, ``Example.COM'' and ``example.com'' would split into two buckets and the lock would not protect both.
+
+\subsection{HTTP Fetch Layer}
+
+\subsubsection{Persistent \code{aiohttp} Fetcher}
+
+The default page fetcher is an \code{AiohttpPageFetcher} that owns its own asyncio event loop and a persistent \code{ClientSession}. The session uses a \code{TCPConnector} with DNS caching (\code{ttl\_dns\_cache=300}s) and per-host connection limits. Crucially, the connector is reused across page fetches so DNS resolutions are amortized and TCP connections to the same host are recycled.
+
+\begin{table}[H]
+\centering
+\caption{aiohttp page-fetcher configuration}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+DNS cache TTL & 300s (\code{DNS\_CACHE\_TTL\_SECONDS} env var)\\
+Connection pool limit & 100 (\code{PAGE\_FETCH\_POOL\_LIMIT})\\
+Per-host limit & 4 (\code{PAGE\_FETCH\_LIMIT\_PER\_HOST})\\
+Total timeout & 13.05s\\
+Connect timeout & 3.05s\\
+Socket read timeout & 10s\\
+Redirects & followed; final URL used for storage\\
+Content filter & only \code{text/html} stored\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A \code{requests.Session} fetcher remains as a fallback for environments without \code{aiohttp}; both fetchers honour the same \code{verify\_owner} contract.
+
+\subsubsection{Per-Domain User-Agent Stability}
+
+Rotating User-Agent headers per request would break HTTP keep-alive on some anti-bot proxies. The worker maintains a \code{domain\_user\_agents} dict keyed by domain so all requests to one host share one consistent User-Agent across the worker's lifetime.
+
+\subsection{Storage Layer with Transactional Outbox}
+\label{sec:storage}
+
+Every crawled page produces five MongoDB writes plus one MinIO/S3 object write. The five Mongo writes happen inside one transaction, anchored to the URL as the durable identity:
+
+\begin{enumerate}
+  \item \code{pages\_metadata}: upsert by URL; \code{\$setOnInsert} preserves the original \code{first\_crawled\_at}.
+  \item \code{pages\_content}: upsert by URL; stores the blob pointer (\code{content\_path}, \code{content\_store}, \code{content\_uri}) and the outbound link list.
+  \item \code{pages\_documents}: upsert by URL; stores clean text and crawl\_version.
+  \item \code{index\_outbox}: insert; status = \code{pending}; carries the \code{crawl\_version} so the streaming indexer can reject stale events.
+  \item \code{graph\_outbox}: insert; status = \code{pending}; carries \code{new\_outbound\_links} and \code{crawl\_version}.
+\end{enumerate}
+
+The MinIO write happens \emph{before} the Mongo transaction so the transaction commit makes the blob pointer durable only if the blob itself is already there. A blob orphan (uploaded but never pointed to) is harmless and gets cleaned up by storage hygiene tools; a pointer to a non-existent blob would be a hard fault.
+
+\begin{figure}[H]
+\centering
+\rendered{figures/transactional_outbox.pdf}{0.96}{Transactional outbox sequence: crawler-worker writes 5 collections in one Mongo transaction; streaming-indexer and pagerank-worker consume from outboxes asynchronously. Render \texttt{report/mermaid/transactional\_outbox.mmd}.}
+\caption{Transactional outbox: write-once, consume-many with claim/process/done lifecycle.}
+\label{fig:outbox}
+\end{figure}
+
+\subsubsection{Delayed-ACK Lease Release}
+
+The storage layer batches 5--50 page transactions before flushing (configurable via \code{--batch-size}). The worker does \emph{not} release the URL's lease until the storage \code{flush\_batch} returns successfully; on commit it gets back a \code{FlushResult} with three lists:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{committed} --- page is durable in Mongo. Worker calls \code{ledger.release(url)} and increments \code{pages\_crawled}.
+  \item \code{duplicate} --- another worker beat us to the same content (URL upsert path). Worker calls \code{ledger.release(url)} and increments \code{content\_duplicates}.
+  \item \code{failed} --- transaction aborted (network blip, replica step-down). Worker calls \code{ledger.release(url)} \emph{and} re-enqueues the URL via \code{frontier.enqueue} with the original priority/retries.
+\end{itemize}
+
+If the worker dies between \code{add\_page} and \code{flush\_batch}, the lease expires naturally and the URL is recovered. Without the delayed-ACK design, the worker would have already released the lease when the URL was queued in memory --- a subsequent OOM-kill would lose the page silently.
+
+\subsection{Streaming Indexer}
+\label{sec:streaming-indexer}
+
+The streaming indexer is a long-running consumer that reads \code{index\_outbox}, computes the precise term-count diff for each URL, and updates \code{term\_postings}.
+
+\subsubsection{Claim/Process/Done Lifecycle}
+
+Events live in \code{index\_outbox} with one of three statuses: \code{pending}, \code{processing}, \code{done}. The consumer claims by:
+
+\begin{lstlisting}
+self.outbox.find_one_and_update(
+    {'status': 'pending'},
+    {'$set': {'status': 'processing',
+              'claimed_at': datetime.utcnow(),
+              'worker_id': self.worker_id}},
+    sort=[('_id', 1)],
+    return_document=ReturnDocument.AFTER,
+)
+\end{lstlisting}
+
+\code{find\_one\_and\_update} is atomic in MongoDB: only one consumer wins each event. If the consumer crashes mid-process, the event remains in \code{processing} state until \code{reclaim\_stale\_events()} (run on each consumer's main loop) returns it to \code{pending} after a configurable timeout (default 300s).
+
+\subsubsection{Per-URL Term-Count Snapshot}
+
+The naive ``add new postings'' approach leaks stale postings forever when a URL is recrawled with different content. The implemented approach reads the URL's prior term-count snapshot from \code{indexed\_documents}, computes new term counts by running the same tokenizer/stemmer the search API uses, and produces three operations:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item For each term in the old snapshot but not the new: delete the \code{(term, url)} document from \code{term\_postings}.
+  \item For each term in the new snapshot: upsert \code{(term, url)} with the new \code{term\_frequency}.
+  \item Update \code{indexed\_documents} with the new snapshot and the new \code{crawl\_version}.
+\end{itemize}
+
+The whole sequence runs in a Mongo transaction so a crash mid-update cannot leave \code{term\_postings} inconsistent with \code{indexed\_documents}.
+
+\subsubsection{Crawl-Version Conflict Detection}
+
+If the same URL is crawled twice in quick succession, both crawl events are queued in \code{index\_outbox}. The indexer reads the URL's current \code{pages\_documents} document and compares its \code{crawl\_version} against the event's \code{crawl\_version}. If the document has a newer version, the older event is marked \code{done} with \code{skipped\_reason = 'stale\_document\_version'}. This prevents an out-of-order event from clobbering the newer index state.
+
+\subsection{Incremental PageRank Worker}
+\label{sec:pagerank}
+
+The PageRank worker maintains a live, $\varepsilon$-bounded approximation of personalized PageRank over the crawled graph. It consumes \code{graph\_outbox} for edge-change events and runs a separate residual-push loop to propagate accumulated mass.
+
+\begin{figure}[H]
+\centering
+\rendered{figures/pagerank_residual.pdf}{0.94}{PageRank residual-push flow: edge-change deltas accumulate as residuals; residuals propagate through successors until $|residual| \leq \varepsilon \cdot rank$. Render \texttt{report/mermaid/pagerank\_residual.mmd}.}
+\caption{Incremental PageRank with residual push.}
+\label{fig:pagerank}
+\end{figure}
+
+\subsubsection{Edge-Change Delta Computation}
+
+When a page \(u\) is recrawled with new outbound links \(N\) (replacing prior set \(O\)), the worker computes contribution deltas from \(u\) at its current rank \(r_u\) with damping factor \(d\):
+
+\begin{align}
+\Delta_v &= +\frac{d \cdot r_u}{|N|} \quad \text{for } v \in N \quad \text{(new contributions)}\\
+\Delta_v &= -\frac{d \cdot r_u}{|O|} \quad \text{for } v \in O \quad \text{(retracted contributions)}
+\end{align}
+
+If \(|O| = 0\) or \(|N| = 0\) (dangling page), the contribution is distributed uniformly over the personalization vector instead of evaporating, preserving total mass.
+
+Each $\Delta_v$ is added to \code{pagerank\_nodes[v].residual} via \code{\$inc} inside the same Mongo transaction that updates \code{graph\_edges} for $u$. The transaction guarantees that the edge change and its rank consequences become visible together.
+
+\subsubsection{Residual-Push Propagation}
+
+A separate loop scans \code{pagerank\_nodes} for entries where \(|residual| > \varepsilon \cdot \max(|rank|, \textit{rank\_floor})\), claims them, and pushes:
+
+\begin{enumerate}
+  \item Atomically claim node by setting \code{residual\_claimed\_at} and \code{residual\_worker\_id}.
+  \item Inside a transaction: add the residual to the node's \code{rank}; reset \code{residual} to 0.
+  \item For each successor in \code{graph\_edges[node]}: \code{\$inc} their residual by $d \cdot \textit{residual} / |\textit{successors}|$.
+  \item For dangling nodes: distribute over the personalization vector.
+\end{enumerate}
+
+The threshold is multiplicative on rank, so well-ranked nodes receive less frequent but larger pushes; small-rank nodes receive frequent small pushes. This preserves convergence: residuals strictly decrease in magnitude through the chain of pushes (per-push contraction factor $d$ < 1), so the queue of pushable nodes drains to empty in steady state.
+
+\subsubsection{Power-Iteration Recompute Fallback}
+
+Residual push is an \emph{approximate} maintenance loop. The CLI \code{pagerank\_worker --recompute} runs classic power iteration:
+
+\begin{equation}
+PR_{t+1}(v) = \frac{1-d}{N} + d \sum_{u \in B_v} \frac{PR_t(u)}{|N_u|}
+\end{equation}
+
+with dangling-mass redistribution and personalization-vector teleport, until the L1 delta falls below \code{convergence\_epsilon} (default $10^{-8}$) or \code{max\_iterations} (default 100). The result overwrites \code{pagerank\_nodes} with \code{residual = 0}, providing a known-correct anchor that the streaming worker then maintains forward from.
+
+\subsubsection{Personalization Vector}
+
+If \code{seed\_urls} is provided to the PageRank worker, the personalization vector is uniform over those seeds; otherwise, it is uniform over all known nodes. Personalized teleport biases authority toward seed pages, which is the intended behaviour for a topic-focused crawl.
+
+\subsection{Search API}
+\label{sec:search}
+
+\code{search-api} exposes \code{GET /search?q=...\&limit=K} via FastAPI. Internally, the entire ranking computation runs as one MongoDB aggregation pipeline against \code{term\_postings}, joined with \code{pagerank\_nodes} via \code{\$lookup}.
+
+\subsubsection{Query Pipeline}
+
+\begin{enumerate}
+  \item Tokenize the query through the same \code{MapReduceIndexer.tokenize} the streaming indexer uses (lowercase, stop-word filter, stem). Same tokens means same stems means matched postings.
+  \item Compute per-term query weights (a query that says ``crawler crawler search'' weights ``crawl'' twice).
+  \item \code{\$match} the term set, \code{\$addFields} the per-document query weight, \code{\$group} by URL summing $\textit{tf} \times \textit{query\_weight}$ into \code{term\_score}.
+  \item \code{\$lookup} \code{pagerank\_nodes} by URL; default \code{authority\_score} to 1.0 if no rank exists yet.
+  \item \code{\$addFields} \code{score = term\_score $\times$ authority\_score}.
+  \item \code{\$sort} by score descending; \code{\$limit} K.
+  \item \code{\$project} only \code{(url, title, page\_id, score, term\_score, authority\_score)}.
+  \item Bulk-fetch the K texts from \code{pages\_documents}; build snippets centred on the first term hit.
+\end{enumerate}
+
+Sort and limit happen \emph{inside} MongoDB, so FastAPI never holds a full posting list in memory --- a search for a hot term like ``crawler'' that matches a million postings still returns K rows to Python.
+
+\begin{figure}[H]
+\centering
+\rendered{figures/index_search_flow.pdf}{0.96}{End-to-end index/search flow: crawler writes outboxes, streaming indexer/PageRank worker drain them, search API blends \texttt{tf} with PageRank inside Mongo aggregation. Render \texttt{report/mermaid/index\_search\_flow.mmd}.}
+\caption{Streaming index, PageRank, and search flow.}
+\label{fig:index-search}
+\end{figure}
+
+\subsection{Worker State Machine}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/worker_lld.pdf}{0.92}{Worker LLD state machine including delayed-ACK, zombie verification, and politeness lock TTL shrink. Render \texttt{report/mermaid/worker\_lld.mmd}.}
+\caption{Worker state machine.}
+\label{fig:worker-lld}
+\end{figure}
+
+The worker repeatedly executes:
+
+\begin{enumerate}
+  \item Check \code{crawler:shutdown} flag.
+  \item Throttled call to \code{recover\_stale\_urls()} (default once per 10s).
+  \item \code{frontier.dequeue()} returns \code{(domain, url\_json, priority)} or signals empty.
+  \item \code{politeness.can\_crawl\_domain(domain)} acquires the lock with TTL covering fetch + cooldown; on failure, re-enqueue URL, push domain back, sleep briefly.
+  \item \code{ledger.claim(url, url\_data, worker\_id)} writes the lease and processing-index in one Lua call.
+  \item Fetch the page; on \code{finally}, call \code{politeness.release\_after\_crawl\_domain(domain)} to shrink the lock TTL.
+  \item \code{ledger.verify\_owner(url)} --- if False, abort (zombie); if True, proceed.
+  \item Parse, extract clean text, extract links, batch-validate links through Bloom + robots, enqueue allowed links.
+  \item Write blob to MinIO/S3; \code{storage.add\_page(...)} queues the page in the worker's batch.
+  \item \code{\_maybe\_flush()} flushes when batch is full; processes the FlushResult to release leases or re-enqueue failures.
+  \item \code{frontier.push\_back(domain)} so the domain rejoins \code{active\_domains} for its next URL.
+\end{enumerate}
+
+%% ===================================================================
+\section{Distributed-Systems Guarantees}
+%% ===================================================================
+
+The implementation provides the following guarantees, each backed by a specific code path:
+
+\begin{table}[H]
+\centering
+\caption{Distributed-systems properties and their enforcement points}
+\small
+\begin{tabular}{p{0.32\textwidth}p{0.18\textwidth}p{0.42\textwidth}}
+\toprule
+Property & Status & Enforcement \\
+\midrule
+Multiple workers can run on different hosts & Yes & All shared state is in Redis/Mongo/MinIO; no per-worker assumptions.\\
+No SPOF in hot path & Yes & MasterV3 is monitoring-only; crawl loop is decentralized.\\
+Same URL not crawled concurrently & Yes & Lua-atomic Bloom add + Lua-atomic frontier dequeue + per-URL lease.\\
+Page never written twice to Mongo & Yes & Upsert by URL with crawl\_version in same transaction.\\
+Worker death $\to$ URL recovered & Yes & Lease TTL expires; \code{recover\_stale\_urls} re-enqueues.\\
+Worker stall $\to$ no zombie write & Yes & \code{verify\_owner} pre-check + atomic \code{release} returns False if displaced.\\
+No lost pages on OOM mid-batch & Yes & Lease released only after \code{flush\_batch} commits.\\
+Outbox events never orphaned & Yes & Page + outbox events in one Mongo transaction.\\
+Streaming indexer survives crashes & Yes & \code{claim\_timeout} reclaim returns events to \code{pending}.\\
+PageRank survives crashes & Yes & Outbox events and residual claims both reclaimable.\\
+Cross-machine clock drift safe & Yes & All TTLs are server-side (Redis or Mongo).\\
+Polite per-domain rate limit under N workers & Yes & Owner-tagged Redis lock per domain.\\
+Search API doesn't OOM on hot terms & Yes & \code{\$sort}/\code{\$limit} happen in Mongo aggregation.\\
+Mongo failover during a write & Partial & Single-node replica set in Compose; transactions correct but no HA failover.\\
+Redis failover during Lua script & No & Single-node Redis; HA requires Sentinel/Cluster (documented limit).\\
+\bottomrule
+\end{tabular}
+\normalsize
+\end{table}
+
+The two ``Partial / No'' rows are application-level rather than infrastructure-level; the Compose stack is application-HA only. Production deployment requires Redis Sentinel or Cluster, a multi-node MongoDB replica set, and distributed MinIO or real S3.
+
+%% ===================================================================
+\section{Performance Metrics and Testing}
+%% ===================================================================
+
+\subsection{Test Topology}
+
+All measurements run against the Docker Compose stack defined in \code{docker-compose.yml}: Redis 7-alpine, MongoDB 7 in single-node replica set \code{rs0}, MinIO, plus crawler/streaming-indexer/PageRank/search-api containers built from the project Dockerfile.
+
+\begin{table}[H]
+\centering
+\caption{Default reference environment for empirical runs}
+\begin{tabular}{p{0.28\textwidth}p{0.62\textwidth}}
+\toprule
+Item & Value \\
+\midrule
+Compose stack & Redis 7-alpine, MongoDB 7 (rs0), MinIO release 2025-04-22\\
+Crawl fixture & 20 \code{ThreadingHTTPServer} instances on ports 9292--9311; 600 pages/domain; 10ms simulated latency per page\\
+Worker scaling sweep & 1 to 20 independent worker subprocesses using the same \code{src/v3/worker\_v3.py} code path as the Docker worker container\\
+Streaming indexer measurement & Real \code{index\_outbox} drain using \code{src/indexer/streaming\_indexer.py}\\
+PageRank measurement & Real \code{graph\_outbox} drain plus power-iteration convergence over the resulting \code{graph\_edges} snapshot\\
+Search workload & query mix of frequent / multi-term / rare / unknown\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Metric Categories}
+
+The evaluation scripts produce data in the following categories, each backed by a CSV/JSON in \code{results/processed/} and a graph in \code{results/figures/}:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Worker scaling}: crawl time, throughput (pages/s), speedup, parallel efficiency, duplicates filtered, per-worker contribution.
+  \item \textbf{Streaming indexer scaling}: outbox drain rate vs. crawler arrival rate; lag (events in \code{pending} state) over time.
+  \item \textbf{PageRank scaling}: residual-push throughput; convergence time (full-recompute mode).
+  \item \textbf{Search latency}: end-to-end \code{/search} latency by query type (mean, median, p95).
+  \item \textbf{Storage}: blob compression ratio; MongoDB collection sizes; MinIO bucket size.
+  \item \textbf{Coordination}: Redis operation latency for frontier ops, Bloom add, lease ops, politeness lock.
+  \item \textbf{Fault tolerance}: deterministic kill scenario --- one worker terminated mid-crawl, asserts that all in-flight URLs are recovered and that the processing index drains to zero.
+  \item \textbf{Correctness}: distributed-test fixture asserts that script/style noise does not enter the index, that ``kiwi'' ranks \code{/alpha} above \code{/beta}, that ``nebulaunique'' returns \code{/beta}, that an unknown term returns an empty result.
+\end{itemize}
+
+\subsection{Metric Formulae}
+
+The report intentionally separates measurement from interpretation. The scripts write raw rows first; the graph and table generator then computes only deterministic summaries from those rows.
+
+\begin{align}
+\text{throughput}_N &= \frac{\text{pages stored}_N}{\text{elapsed seconds}_N}\\
+\text{speedup}_N &= \frac{T_1}{T_N}\\
+\text{parallel efficiency}_N &= \frac{\text{speedup}_N}{N}\\
+\text{search score}(u, q) &= \left(\sum_{t \in q} tf(t,u) \cdot qtf(t,q)\right) \cdot \max(PR(u), 0)
+\end{align}
+
+Query latency is measured as end-to-end HTTP round-trip time to \code{/search}; the reported p95 is the smallest measured latency at or above 95\% of sorted samples. Streaming lag is the count of \code{index\_outbox} events still in \code{pending}. PageRank convergence is the L1 norm \(\sum_u |PR_i(u)-PR_{i-1}(u)|\) after each power-iteration pass.
+
+\subsubsection{PageRank Delta Worked Example}
+
+Suppose page \(S\) currently has \(PR(S)=0.60\), damping \(d=0.85\), and the last crawl linked to \(A,B,C\). The new crawl links to \(A,C,D,E\). The old per-edge contribution was:
+
+\[
+old = d \cdot \frac{PR(S)}{3} = 0.85 \cdot \frac{0.60}{3} = 0.17
+\]
+
+The new per-edge contribution is:
+
+\[
+new = d \cdot \frac{PR(S)}{4} = 0.85 \cdot \frac{0.60}{4} = 0.1275
+\]
+
+Therefore \(B\) receives \(-0.17\) because the edge disappeared; \(D\) and \(E\) each receive \(+0.1275\); retained links \(A\) and \(C\) each receive \(0.1275-0.17=-0.0425\). Those deltas are added to target residuals. If a target residual exceeds \(\varepsilon \cdot \max(|PR|, rank\_floor)\), the PageRank worker pushes it to that target's successors.
+
+\IfFileExists{generated_results.tex}{%
+  \input{generated_results.tex}%
+}{%
+  \regenerateTable{Measured result tables have not been generated yet. Run \texttt{python scripts/generate\_evaluation\_graphs.py} after the evaluation scripts.}%
+}
+
+\subsection{Generated Figures}
+
+The following figures are generated from CSV/JSON files in \code{results/processed/}; architecture diagrams are rendered from \code{report/mermaid/*.mmd}.
+
+\begin{figure}[H]
+\centering
+\rendered{figures/throughput_vs_workers.pdf}{0.78}{Throughput (pages/s) vs.\ worker count.}
+\caption{Crawler throughput vs.\ workers.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/speedup_vs_workers.pdf}{0.78}{Measured speedup vs.\ ideal linear speedup.}
+\caption{Speedup curve.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/streaming_indexer_lag.pdf}{0.78}{\code{index\_outbox} pending count over time at various crawler scaling levels.}
+\caption{Streaming indexer drain vs.\ crawler arrival.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/pagerank_convergence.pdf}{0.78}{Full-recompute L1 delta vs.\ iteration; residual-push convergence to $\varepsilon$ over time.}
+\caption{PageRank convergence.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/query_latency_by_type.pdf}{0.78}{Search API latency by query type (frequent, multi-term, rare, unknown).}
+\caption{Search latency.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/redis_operation_latency.pdf}{0.78}{Redis operation latency: frontier Lua scripts, Bloom add, lease claim, politeness lock.}
+\caption{Redis coordination latency.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/mongodb_latency.pdf}{0.78}{MongoDB operation latency: page transaction, outbox claim, term\_postings upsert, search aggregation.}
+\caption{MongoDB operation latency.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\rendered{figures/fault_tolerance_completed_pages.pdf}{0.66}{Fault-tolerance scenario: one worker killed mid-run; the remaining workers continue and the processing index drains to zero.}
+\caption{Worker termination tolerance.}
+\end{figure}
+
+\subsection{Correctness Tests}
+
+The deterministic distributed-systems test \code{tests/distributed\_system\_test.py} runs end-to-end: it spins up a fixture HTTP server, three crawler subprocesses (one of which is killed mid-crawl to exercise the recovery path), drains the streaming indexer and PageRank worker, and executes search queries against the live API. The test asserts:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{pages\_metadata\_count >= 4} (the kill scenario does not stop the others).
+  \item \code{processing\_size == 0} (recovery sweep cleans abandoned leases).
+  \item \code{alpha\_url\_count == 1} (URL normalization collapses the fragment-only duplicate).
+  \item Script and style markers are absent from the indexed text.
+  \item \code{index\_outbox\_pending == 0} and \code{graph\_outbox\_pending == 0} (streaming pipeline drained completely).
+  \item \code{term\_postings\_count > 0} and \code{pagerank\_nodes\_count > 0} (the streaming workers actually wrote state).
+  \item \code{kiwi\_search} returns \code{/alpha} as the top hit; \code{nebulaunique} returns \code{/beta}; \code{notpresentterm} returns empty.
+\end{itemize}
+
+The unit test suite under \code{tests/test\_core\_unit.py} contains 15 unit tests covering URL normalization, link extraction with fragment removal, Bloom-based deduplication on a single page, stem-aware tokenisation, the search aggregation pipeline shape, the blob-pointer storage path, and per-domain User-Agent stability.
+
+%% ===================================================================
+\section{Failure Modes and Recovery}
+%% ===================================================================
+
+\begin{table}[H]
+\centering
+\caption{Failure scenarios and their recovery paths}
+\small
+\begin{tabular}{p{0.34\textwidth}p{0.58\textwidth}}
+\toprule
+Failure & Recovery \\
+\midrule
+Crawler worker crashes mid-fetch & Lease key expires natively; \code{recover\_stale\_urls} re-enqueues; another worker picks up the URL. No data loss because the page was never written.\\
+Crawler worker crashes between \code{add\_page} and \code{flush\_batch} & Lease still held by the dead worker; recovery sweep re-enqueues; another worker re-fetches and re-stores the page.\\
+Mongo page transaction fails (replica step-down, network blip) & The whole batch's URLs land in the FlushResult \code{failed} list; the worker re-enqueues them with priority decay and incremented retries. No outbox events were emitted because the transaction did not commit.\\
+Streaming indexer claims an event then crashes & Event remains in \code{processing} state; \code{reclaim\_stale\_events} returns it to \code{pending} after \code{claim\_timeout}; another indexer (or the same one on restart) reclaims it.\\
+PageRank worker claims an event then crashes & Same lifecycle as the indexer; reclaim returns the event to \code{pending}.\\
+PageRank worker claims a residual-push then crashes & Residual node remains claimed; \code{reclaim\_stale\_residual\_claims} unsets the claim after timeout.\\
+Stalled worker resumes after lease expiry & \code{verify\_owner} returns False; worker increments \code{zombie\_aborts} and aborts before any Mongo write.\\
+Two workers race on the same URL & Lua-atomic Bloom \code{add} returns True for exactly one; the loser's URL never enters the frontier.\\
+Two workers race on the same content (different URLs, identical HTML) & Both write through MinIO (content-addressed, idempotent); both upsert their distinct URL rows in Mongo. No conflict.\\
+Search query for a common term & Mongo aggregation \code{\$sort}/\code{\$limit} returns only K rows to FastAPI; no in-process posting list.\\
+Worker writes raw HTML & Blob lands in MinIO/S3; not in MongoDB; WiredTiger cache stays focused on metadata/postings.\\
+Domain temporarily down or rate-limiting & Politeness lock prevents concurrent retries; URL is re-enqueued after fetch failure with priority decay; eventually drops off after \code{max\_retries}.\\
+Robots.txt fetch times out & Robots-cache fallback allows crawling; the timeout is logged; subsequent fetches use the cached default.\\
+\bottomrule
+\end{tabular}
+\normalsize
+\end{table}
+
+%% ===================================================================
+\section{Assumptions and Limits}
+%% ===================================================================
+
+\subsection{Operational}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Compose deployment uses single-node Redis, single-node MongoDB replica set, single-node MinIO. This is application-HA, not infrastructure-HA. Production deployment requires Redis Sentinel/Cluster, multi-node Mongo replica set, distributed MinIO or real S3.
+  \item Workers, indexers, PageRank workers, and the search API can each scale independently. The Compose file uses \code{restart: unless-stopped} so a Python crash auto-restarts.
+  \item The blob store can be either local filesystem (for debugging) or S3-compatible (for distributed runs). \code{CRAWLER\_CONTENT\_STORE=s3} with \code{S3\_ENDPOINT\_URL} pointing at MinIO is the default in Compose.
+\end{itemize}
+
+\subsection{Data}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item The crawler handles static HTML; it does not execute JavaScript.
+  \item Only \code{<a href>} tags are extracted as outbound links.
+  \item URL normalization lowercases scheme/netloc, strips default ports (\code{:80}, \code{:443}), drops fragments, sorts query parameters, and strips common tracking parameters (\code{utm\_*}, \code{fbclid}, \code{gclid}, \code{mc\_cid}, \code{mc\_eid}).
+  \item UTF-8 is assumed for HTML; other encodings are decoded with \code{errors='replace'}.
+\end{itemize}
+
+\subsection{Security}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item No production authentication on the search API.
+  \item Local-only by default; expose externally only through a reverse proxy with TLS and auth.
+  \item Public pages only; the crawler honours \code{robots.txt} disallow rules through the parsed RobotFileParser.
+\end{itemize}
+
+\subsection{Scale}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Bloom filter sized for $10^7$ URLs at $10^{-3}$ false-positive rate. Crawls beyond this density should rebuild the filter at a larger size or migrate to scalable variants (e.g.\ rotating Bloom).
+  \item Single-node Redis: at the documented per-Lua-script latency, $\sim$1000 frontier ops/s is comfortable on commodity hardware. Higher rates require Redis Cluster sharding.
+  \item Single-node Mongo replica set: write throughput is bounded by one primary's commit rate. Production crawls should shard.
+\end{itemize}
+
+%% ===================================================================
+\section{Future Work}
+%% ===================================================================
+
+\subsection{Search Quality}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Replace \(\sum tf\) with BM25 scoring (uses document length and average length).
+  \item Add phrase queries (positional postings).
+  \item Add a CTR-style learned reranker on top of the Mongo aggregation.
+\end{itemize}
+
+\subsection{Crawl Coverage}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item JavaScript rendering for SPA-heavy sites (Playwright or headless Chrome behind a per-page worker).
+  \item \code{<sitemap>} parsing for proactive discovery.
+  \item Adaptive crawl-delay based on observed server response times.
+\end{itemize}
+
+\subsection{Infrastructure}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Replace single-node Redis with Redis Cluster sharded by domain hash.
+  \item Replace single-node MongoDB replica set with a 3-node replica or sharded cluster.
+  \item Migrate from MinIO to real S3 for durable blob storage.
+  \item Add Prometheus metrics endpoints to all four services and a Grafana dashboard.
+\end{itemize}
+
+\subsection{Algorithmic}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Topic-sensitive PageRank (multiple personalization vectors).
+  \item MinHash near-duplicate detection on document text (currently exact content-hash dedup).
+  \item Cuckoo filter as a Bloom replacement to support deletes (URL revocation).
+\end{itemize}
+
+\appendix
+
+%% ===================================================================
+\section{Appendix A: Reproducibility}
+%% ===================================================================
+
+The full reproduction sequence is documented in \code{report/REGENERATE.md}. Briefly:
+
+\begin{verbatim}
+docker compose up -d --build redis mongodb minio \
+                            streaming-indexer pagerank-worker search-api
+docker compose --profile tools run --rm seed
+docker compose run --rm crawler-worker python src/v3/worker_v3.py \
+       --worker-id demo-worker --max-pages 30 --idle-timeout 45 --batch-size 5
+docker compose exec -T streaming-indexer python streaming_indexer.py \
+       --once --max-events 1000
+docker compose exec -T pagerank-worker python pagerank_worker.py \
+       --once --max-events 1000 --max-pushes 2000
+curl "http://localhost:8000/search?q=cricket&limit=5"
+
+# Tests:
+python -m unittest tests.test_core_unit
+python tests/distributed_system_test.py
+
+# Empirical evaluations + figures:
+python scripts/run_evaluation_experiments.py
+python scripts/run_resource_scaling_1_20.py
+python scripts/run_report_supplement_metrics.py
+python scripts/generate_evaluation_graphs.py
+
+# Render Mermaid diagrams (requires mermaid-cli, mmdc):
+for f in report/mermaid/*.mmd; do
+  mmdc -i "$f" -o "report/figures/$(basename "${f%.mmd}").pdf"
+done
+
+# Compile the report:
+pdflatex -output-directory report report/main.tex
+\end{verbatim}
+
+%% ===================================================================
+\section{Appendix B: Source Layout}
+%% ===================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{0.42\textwidth}p{0.52\textwidth}}
+\toprule
+Path & Role \\
+\midrule
+\code{src/config.py} & Centralized config (env-overridable).\\
+\code{src/v3/master\_v3.py} & Seed / monitor / shutdown helper.\\
+\code{src/v3/worker\_v3.py} & Crawler worker (the main process).\\
+\code{src/v3/frontier.py} & Two-tier Lua-atomic frontier.\\
+\code{src/v3/bloom\_filter.py} & Lua-atomic Bloom filter.\\
+\code{src/v3/processing\_ledger.py} & Per-URL leases.\\
+\code{src/v3/politeness.py} & Owner-tagged politeness locks.\\
+\code{src/v3/optimized\_storage.py} & Transactional Mongo writes + MinIO/S3 blob store.\\
+\code{src/robots\_handler\_async.py} & Async robots.txt fetcher with Redis cache.\\
+\code{src/indexer/mapreduce\_indexer.py} & Tokenizer + stemmer (shared library) and batch indexer entry point.\\
+\code{src/indexer/streaming\_indexer.py} & \code{index\_outbox} consumer; updates \code{term\_postings} + \code{indexed\_documents}.\\
+\code{src/indexer/pagerank\_worker.py} & \code{graph\_outbox} consumer; residual push + power-iteration recompute.\\
+\code{src/search/search\_api.py} & FastAPI service; tf $\times$ PageRank aggregation pipeline.\\
+\code{tests/test\_core\_unit.py} & Unit tests for pure-logic surfaces (no infra).\\
+\code{tests/distributed\_system\_test.py} & End-to-end test with 3 crawler subprocesses, kill scenario, streaming pipeline drain, search queries.\\
+\code{docker-compose.yml} & 7-service stack (redis, mongodb, minio, crawler-worker, streaming-indexer, pagerank-worker, search-api, seed).\\
+\code{scripts/seed\_from\_file.py} & One-shot seed loader.\\
+\code{scripts/run\_evaluation\_experiments.py} & Empirical evaluation driver.\\
+\code{scripts/run\_resource\_scaling\_1\_20.py} & 1--20 worker resource scaling driver.\\
+\code{scripts/run\_report\_supplement\_metrics.py} & Auxiliary metric collection.\\
+\code{scripts/generate\_evaluation\_graphs.py} & CSV/JSON $\to$ PDF/PNG renderer.\\
+\bottomrule
+\end{tabular}
+\normalsize
+\end{table}
+
+%% ===================================================================
+\section{Appendix C: Result File Layout}
+%% ===================================================================
+
+After regeneration, expect:
+
+\begin{verbatim}
+results/
+  raw/
+    evaluation_results.json
+  processed/
+    crawl_scaling.csv
+    worker_contribution.csv
+    streaming_indexer_lag.csv
+    pagerank_convergence.csv
+    query_latency.csv
+    redis_latency.csv
+    mongodb_latency.csv
+    storage_compression.csv
+    bloom_memory_calculation.csv
+    memory_efficiency.csv
+    sustained_throughput_windows.csv
+    resource_scaling_1_20.csv
+    fault_tolerance.csv
+    inverted_index_correctness.json
+  figures/
+    *.pdf, *.png  (each tied to one CSV/JSON above)
+  distributed_system_test_results.json
+  distributed_test_logs/
+    dist-worker-*.log
+    search_api.log
+\end{verbatim}
+
+%% ===================================================================
+\section{Appendix D: References}
+%% ===================================================================
+
+\begin{enumerate}
+  \item Heydon, A. and Najork, M. ``Mercator: A Scalable, Extensible Web Crawler.'' \emph{World Wide Web}, 1999.
+  \item Mohr, G., Stack, M., Ranitovic, I., Avery, D., and Kimpton, M. ``An Introduction to Heritrix, an Open-Source Archival Quality Web Crawler.'' \emph{IWAW}, 2004.
+  \item Bloom, B.H. ``Space/Time Trade-offs in Hash Coding with Allowable Errors.'' \emph{CACM}, 1970.
+  \item Page, L., Brin, S., Motwani, R., and Winograd, T. ``The PageRank Citation Ranking: Bringing Order to the Web.'' Stanford Tech Report, 1999.
+  \item Bahmani, B., Chowdhury, A., and Goel, A. ``Fast Incremental and Personalized PageRank.'' \emph{VLDB}, 2010.
+  \item Ohsaka, N., Maehara, T., and Kawarabayashi, K. ``Efficient PageRank Tracking in Evolving Networks.'' \emph{KDD}, 2015.
+  \item Dean, J. and Ghemawat, S. ``MapReduce: Simplified Data Processing on Large Clusters.'' \emph{OSDI}, 2004.
+  \item Manning, C., Raghavan, P., and Schutze, H. \emph{Introduction to Information Retrieval}. Cambridge University Press, 2008.
+  \item Kleppmann, M. \emph{Designing Data-Intensive Applications}. O'Reilly, 2017. (Chapters 5, 7, 11 cover the outbox pattern, multi-document transactions, and stream processing.)
+  \item Najork, M. and Wiener, J. ``Breadth-First Search Crawling Yields High-Quality Pages.'' \emph{WWW}, 2001.
+  \item Redis: \url{https://redis.io/documentation}
+  \item MongoDB transactions: \url{https://www.mongodb.com/docs/manual/core/transactions/}
+  \item MinIO: \url{https://min.io/docs/minio/}
+  \item FastAPI: \url{https://fastapi.tiangolo.com/}
+  \item robots.txt: \url{https://www.robotstxt.org/}
+\end{enumerate}
+
+\end{document}

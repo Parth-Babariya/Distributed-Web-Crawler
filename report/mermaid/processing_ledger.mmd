@@ -1,0 +1,33 @@
+stateDiagram-v2
+    [*] --> Unclaimed
+    Unclaimed --> Claimed: ledger.claim(url, worker_id, ttl)<br/>SET processing_lease:&lt;url&gt; worker_id PX ttl<br/>HSET crawler:processing url url_data<br/>(one Lua script)
+
+    Claimed --> Renewed: ledger.renew(url, worker_id)<br/>GET-compare-PEXPIRE (Lua)
+    Renewed --> Claimed
+
+    Claimed --> Released: ledger.release(url, worker_id)<br/>GET-compare-DEL+HDEL (Lua)<br/>returns 1 -> we owned it
+    Released --> [*]
+
+    Claimed --> Zombie: ledger.release returns 0<br/>(another worker reclaimed us)
+    Zombie --> [*]
+
+    Claimed --> Expired: PEXPIRE fires - worker died<br/>or stalled past ttl
+    Expired --> Recovered: another worker calls<br/>ledger.recover_stale()<br/>EXISTS lease == 0 -> HDEL hash<br/>re-enqueue url to frontier
+    Recovered --> [*]
+
+    note right of Claimed
+        Worker MUST verify_owner(url)
+        before any irreversible
+        side-effect (Mongo write).
+        If verify fails, abort -
+        a recovery worker has
+        already taken over.
+    end note
+
+    note right of Recovered
+        Recovery is throttled to
+        once per recovery_interval
+        (default 10 s) - lease TTL
+        bounds the freshness, not
+        the recovery loop frequency.
+    end note
