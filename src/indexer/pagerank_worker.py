@@ -340,23 +340,34 @@ class IncrementalPageRankWorker:
         return False
 
     def claim_residual_node(self) -> Optional[Dict]:
-        return self.nodes.find_one_and_update(
-            {
-                'residual_claimed_at': {'$exists': False},
-                '$or': [
-                    {'residual': {'$gt': self.epsilon}},
-                    {'residual': {'$lt': -self.epsilon}},
-                ],
-            },
-            {
-                '$set': {
-                    'residual_claimed_at': datetime.utcnow(),
-                    'residual_worker_id': self.worker_id,
-                }
-            },
-            sort=[('last_updated', 1)],
-            return_document=ReturnDocument.AFTER,
-        )
+        """Claim the node with the largest residual (Gauss-Southwell order).
+
+        Pushing the biggest residual first converges far faster than FIFO,
+        and a FIFO by last_updated starved hubs: every incoming increment
+        refreshed their timestamp and sent them to the back of the queue.
+        Calls alternate between the largest positive and the most negative
+        residual so retracted mass is not starved by new mass either.
+        """
+        self._prefer_negative = not getattr(self, '_prefer_negative', True)
+        claim = {
+            '$set': {
+                'residual_claimed_at': datetime.utcnow(),
+                'residual_worker_id': self.worker_id,
+            }
+        }
+        positive = ({'residual': {'$gt': self.epsilon}}, [('residual', -1)])
+        negative = ({'residual': {'$lt': -self.epsilon}}, [('residual', 1)])
+        order = (negative, positive) if self._prefer_negative else (positive, negative)
+        for condition, sort in order:
+            node = self.nodes.find_one_and_update(
+                {'residual_claimed_at': {'$exists': False}, **condition},
+                claim,
+                sort=sort,
+                return_document=ReturnDocument.AFTER,
+            )
+            if node is not None:
+                return node
+        return None
 
     def push_residual(self, node: Dict) -> bool:
         url = node['url']
