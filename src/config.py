@@ -29,7 +29,7 @@ class CrawlerConfig:
     # Crawler Configuration
     USER_AGENT = os.getenv(
         'USER_AGENT',
-        'DistributedCrawler/1.0 (+https://github.com/yourproject/crawler)'
+        'DistributedCrawler/1.0 (+https://github.com/Parth-Babariya/Distributed-Web-Crawler)'
     )
     REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 10))
     CRAWL_DELAY = float(os.getenv('CRAWL_DELAY', 0.5))

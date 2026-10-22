@@ -42,7 +42,7 @@ class AsyncRobotsHandler:
     """
     
     def __init__(self, redis_host='localhost', redis_port=6379, 
-                 user_agent='Mozilla/5.0 (compatible; WebCrawler/3.0)',
+                 user_agent='DistributedCrawler/1.0',
                  cache_ttl=3600):
         """
         Initialize async robots.txt handler.

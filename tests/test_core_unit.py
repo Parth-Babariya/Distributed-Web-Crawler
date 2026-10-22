@@ -13,6 +13,7 @@ from optimized_storage import LocalHtmlBlobStore, OptimizedStorage
 from robots_handler_async import AsyncRobotsHandler
 from search.search_api import SearchService
 from worker_v3 import DecentralizedWorker, PageFetchResult
+from config import CrawlerConfig
 
 
 class CoreCrawlerTests(unittest.TestCase):
@@ -25,7 +26,6 @@ class CoreCrawlerTests(unittest.TestCase):
         worker.worker_id = 'unit-test'
         worker.session = TimeoutSession()
         worker.stats = {'timeouts': 0, 'errors': 0}
-        worker._random_user_agent = lambda: 'unit-test'
 
         self.assertIsNone(worker.fetch_page('http://example.com/slow'))
         self.assertEqual(worker.stats['timeouts'], 1)
@@ -49,7 +49,6 @@ class CoreCrawlerTests(unittest.TestCase):
         worker.worker_id = 'unit-test'
         worker.session = Session()
         worker.stats = {'timeouts': 0, 'errors': 0}
-        worker._random_user_agent = lambda: 'unit-test'
 
         self.assertIsNone(worker.fetch_page('http://example.com/data.json'))
 
@@ -67,7 +66,6 @@ class CoreCrawlerTests(unittest.TestCase):
         worker.worker_id = 'unit-test'
         worker.page_fetcher = Fetcher()
         worker.stats = {'timeouts': 0, 'errors': 0}
-        worker._random_user_agent = lambda: 'unit-test'
 
         html = worker.fetch_page('http://example.com/start')
 
@@ -200,8 +198,6 @@ class CoreCrawlerTests(unittest.TestCase):
         worker.concurrency = 4
         worker.stats = {'pages_crawled': 5}
         worker.storage = Storage()
-        worker.domain_user_agents = {}
-        worker._random_user_agent = lambda: 'ua'
         worker.pull_url_from_frontier = lambda: next(urls)
         pool = Pool()
         in_flight = {object(): {'url': 'http://busy.test/'}}
@@ -218,19 +214,41 @@ class CoreCrawlerTests(unittest.TestCase):
         worker.pull_url_from_frontier = lambda: None
         self.assertEqual(worker._dispatch_fetches(None, {}, max_pages=None), 0)
 
-    def test_user_agent_is_stable_per_domain(self):
+    def test_every_request_uses_the_configured_crawler_identity(self):
+        class Fetcher:
+            def __init__(self):
+                self.agents = []
+
+            def fetch(self, url, user_agent):
+                self.agents.append(user_agent)
+                return PageFetchResult(html='<html></html>', final_url=url)
+
         worker = DecentralizedWorker.__new__(DecentralizedWorker)
-        worker.domain_user_agents = {}
-        agents = iter(['agent-a', 'agent-b'])
-        worker._random_user_agent = lambda: next(agents)
+        worker.worker_id = 'unit-test'
+        worker.page_fetcher = Fetcher()
+        worker.stats = {'timeouts': 0, 'errors': 0}
 
-        first = worker._user_agent_for_url('https://example.com/one')
-        second = worker._user_agent_for_url('https://example.com/two')
-        third = worker._user_agent_for_url('https://other.example/one')
+        for url in ('https://example.com/one', 'https://example.com/two', 'https://other.example/'):
+            worker.fetch_page(url)
 
-        self.assertEqual(first, 'agent-a')
-        self.assertEqual(second, 'agent-a')
-        self.assertEqual(third, 'agent-b')
+        self.assertEqual(set(worker.page_fetcher.agents), {CrawlerConfig.USER_AGENT})
+        self.assertTrue(CrawlerConfig.USER_AGENT.startswith('DistributedCrawler/'))
+        self.assertNotIn('Mozilla', CrawlerConfig.USER_AGENT)
+
+    def test_sigterm_handler_stops_the_crawl_loop(self):
+        import signal
+
+        worker = DecentralizedWorker.__new__(DecentralizedWorker)
+        worker.worker_id = 'unit-test'
+        worker.running = True
+
+        previous = worker._install_stop_handler()
+        try:
+            self.assertEqual(signal.getsignal(signal.SIGTERM), worker._handle_stop_signal)
+            worker._handle_stop_signal(signal.SIGTERM, None)
+            self.assertFalse(worker.running)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
     def test_url_normalization_strips_fragments_and_default_ports(self):
         worker = DecentralizedWorker.__new__(DecentralizedWorker)

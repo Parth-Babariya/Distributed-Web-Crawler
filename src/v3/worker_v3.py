@@ -7,7 +7,7 @@ Complete rewrite implementing:
 2. Bloom Filter deduplication (98% memory savings)
 3. Distributed politeness (self-regulating)
 4. Batch inserts (20x faster)
-5. Connection pooling + User-Agent rotation
+5. Connection pooling + one honest User-Agent
 6. Compression + split collections
 
 This worker is fully autonomous and coordinates with peers through Redis.
@@ -16,7 +16,7 @@ This worker is fully autonomous and coordinates with peers through Redis.
 import logging
 import time
 import json
-import random
+import signal
 import sys
 import os
 import asyncio
@@ -224,19 +224,10 @@ class DecentralizedWorker:
     No Master needed for crawling loop!
     """
     
-    # User-Agent rotation pool
-    USER_AGENTS = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:109.0) Gecko/20100101 Firefox/121.0',
-        'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/121.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0'
-    ]
+    # One honest, stable identity for every request (pages and robots.txt)
+    # so site operators can recognise the crawler and target it in
+    # robots.txt. Configure with the USER_AGENT environment variable.
+    user_agent = CrawlerConfig.USER_AGENT
 
     max_page_bytes = CrawlerConfig.MAX_PAGE_BYTES
 
@@ -319,16 +310,11 @@ class DecentralizedWorker:
         self._pending_url_data: Dict = {}
         # Stat: pages durably stored (incremented when a flush commits).
         self.stats_content_duplicates = 0
-        # Keep one stable User-Agent per domain for this worker. This preserves
-        # HTTP keep-alive behavior and avoids presenting multiple browser
-        # identities over the same pooled connection.
-        self.domain_user_agents: Dict[str, str] = {}
-        
         # Async robots handler for parallel fetching (10x speedup!)
         self.robots_handler_async = AsyncRobotsHandler(
             redis_host=redis_host,
             redis_port=redis_port,
-            user_agent=self._random_user_agent(),
+            user_agent=self.user_agent,
             cache_ttl=86400  # 24 hours
         )
         
@@ -397,23 +383,6 @@ class DecentralizedWorker:
         session.mount('https://', adapter)
         
         return session
-    
-    def _random_user_agent(self) -> str:
-        """Get random User-Agent."""
-        return random.choice(self.USER_AGENTS)
-
-    def _user_agent_for_url(self, url: str) -> str:
-        """Return a stable User-Agent for the URL's domain."""
-        domain = frontier_extract_domain(url) or self._extract_domain(url)
-        if not domain:
-            return self._random_user_agent()
-
-        if not hasattr(self, 'domain_user_agents'):
-            self.domain_user_agents = {}
-
-        if domain not in self.domain_user_agents:
-            self.domain_user_agents[domain] = self._random_user_agent()
-        return self.domain_user_agents[domain]
     
     def _extract_domain(self, url: str) -> str:
         """Extract bare lowercase netloc from URL.
@@ -665,7 +634,7 @@ class DecentralizedWorker:
     
     def fetch_page(self, url: str) -> Optional[str]:
         """
-        Fetch page with aggressive timeout and User-Agent rotation.
+        Fetch page with aggressive timeout.
 
         Args:
             url: URL to fetch
@@ -673,7 +642,7 @@ class DecentralizedWorker:
         Returns:
             HTML content or None on error
         """
-        outcome = self._fetch_outcome(url, self._user_agent_for_url(url))
+        outcome = self._fetch_outcome(url, self.user_agent)
         self._record_fetch_outcome(url, outcome)
         if outcome.html is not None:
             self.last_final_url = self.normalize_url(outcome.final_url or url)
@@ -1100,6 +1069,7 @@ class DecentralizedWorker:
             max_workers=self.concurrency,
             thread_name_prefix=f'{self.worker_id}-fetch',
         )
+        previous_sigterm = self._install_stop_handler()
 
         try:
             while self.running:
@@ -1169,6 +1139,30 @@ class DecentralizedWorker:
                 self._complete_crawl(in_flight.pop(future), self._future_outcome(future))
             fetch_pool.shutdown(wait=True)
             self._shutdown()
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+
+    def _install_stop_handler(self):
+        """Stop the crawl loop cleanly on SIGTERM.
+
+        `docker stop` / `docker compose stop` send SIGTERM, whose default
+        action kills Python without running `finally` blocks: batched pages
+        were lost and their URLs stayed leased until the lease expired. With
+        this handler the loop exits, in-flight fetches finish, the batch is
+        flushed and the leases are released before the process exits.
+        Returns the previous handler, or None when signals cannot be
+        installed (not on the main thread).
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        return signal.signal(signal.SIGTERM, self._handle_stop_signal)
+
+    def _handle_stop_signal(self, signum, frame):
+        logger.info(
+            f"[{self.worker_id}] Received signal {signum}; finishing in-flight "
+            f"work and shutting down"
+        )
+        self.running = False
 
     def _dispatch_fetches(self, fetch_pool: ThreadPoolExecutor,
                           in_flight: Dict[Future, Dict],
@@ -1196,7 +1190,7 @@ class DecentralizedWorker:
                 break
             url = url_data['url']
             logger.info(f"[{self.worker_id}] Crawling: {url}")
-            future = fetch_pool.submit(self._fetch_outcome, url, self._user_agent_for_url(url))
+            future = fetch_pool.submit(self._fetch_outcome, url, self.user_agent)
             in_flight[future] = url_data
             dispatched += 1
         return dispatched

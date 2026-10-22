@@ -73,6 +73,9 @@ services:
       s3:
         condition: service_healthy
     restart: "no"
+    # On SIGTERM the worker finishes in-flight fetches (up to ~13s) and
+    # flushes its batch; give it longer than Docker's default 10s.
+    stop_grace_period: 30s
 
   streaming-indexer:
     build: .
