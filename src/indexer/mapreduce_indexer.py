@@ -42,6 +42,7 @@ class MapReduceIndexer:
         # legacy embedded-array inverted_index, which hit MongoDB's 16MB
         # BSON document limit on common terms during real crawls.
         self.postings = self.db['term_postings']
+        self.state = self.db['indexed_documents']
         self.batch_size = batch_size
         self._create_indexes()
 
@@ -50,6 +51,7 @@ class MapReduceIndexer:
         self.postings.create_index([('term', 1), ('url', 1)], unique=True)
         self.postings.create_index([('term', 1), ('term_frequency', -1)])
         self.postings.create_index('url')
+        self.state.create_index('url', unique=True)
 
     def tokenize(self, text: str) -> List[str]:
         """Normalize text into searchable stem terms."""
@@ -110,8 +112,14 @@ class MapReduceIndexer:
         return stem
 
     def map_document(self, document: Dict) -> Dict[str, Dict]:
-        """Map one document to term posting records."""
+        """Map one document to term posting records.
+
+        Each posting carries the document length and a title-match flag so
+        BM25 scoring in the search API needs no extra lookups.
+        """
         term_counts = Counter(self.tokenize(document.get('text', '')))
+        doc_length = sum(term_counts.values())
+        title_terms = set(self.tokenize(document.get('title', '')))
         postings = {}
 
         for term, count in term_counts.items():
@@ -119,7 +127,9 @@ class MapReduceIndexer:
                 'page_id': document['page_id'],
                 'url': document['url'],
                 'title': document.get('title', ''),
-                'term_frequency': count
+                'term_frequency': count,
+                'doc_length': doc_length,
+                'in_title': term in title_terms,
             }
 
         return postings
@@ -142,28 +152,29 @@ class MapReduceIndexer:
         """
         if reset:
             self.postings.delete_many({})
+            self.state.delete_many({})
             self.documents.update_many({}, {'$set': {'indexed_at': None}})
 
         query = {'indexed_at': None} if only_unindexed else {}
         cursor = self.documents.find(query)
 
         mapped_batch = []
-        indexed_doc_ids = []
+        batch_documents = []
         docs_seen = 0
         terms_written = 0
 
         for document in cursor:
             mapped_batch.append(self.map_document(document))
-            indexed_doc_ids.append(document['_id'])
+            batch_documents.append(document)
             docs_seen += 1
 
             if len(mapped_batch) >= self.batch_size:
-                terms_written += self._flush(mapped_batch, indexed_doc_ids)
+                terms_written += self._flush(mapped_batch, batch_documents)
                 mapped_batch.clear()
-                indexed_doc_ids.clear()
+                batch_documents.clear()
 
         if mapped_batch:
-            terms_written += self._flush(mapped_batch, indexed_doc_ids)
+            terms_written += self._flush(mapped_batch, batch_documents)
 
         return {
             'documents_indexed': docs_seen,
@@ -171,13 +182,17 @@ class MapReduceIndexer:
             'index_postings_total': self.postings.count_documents({}),
         }
 
-    def _flush(self, mapped_batch: List[Dict[str, Dict]], document_ids: List) -> int:
+    def _flush(self, mapped_batch: List[Dict[str, Dict]], documents: List[Dict]) -> int:
         """Flush a batch of mapped postings into term_postings.
 
         We write one document per (term, url) pair via upsert. The legacy
         embedded-array inverted_index has been removed because $addToSet on
         a per-term document hits MongoDB's 16MB BSON limit on common terms
         in any real-world crawl.
+
+        Per-URL state goes to indexed_documents in the same shape the
+        streaming indexer writes, so a later recrawl event can remove this
+        build's postings and search can compute corpus statistics.
         """
         reduced = self.reduce_postings(mapped_batch)
         now = datetime.utcnow()
@@ -194,6 +209,8 @@ class MapReduceIndexer:
                             'url': posting['url'],
                             'title': posting.get('title', ''),
                             'term_frequency': int(posting.get('term_frequency', 0)),
+                            'doc_length': int(posting.get('doc_length', 0)),
+                            'in_title': bool(posting.get('in_title', False)),
                             'updated_at': now,
                         },
                         '$setOnInsert': {
@@ -206,8 +223,33 @@ class MapReduceIndexer:
         if posting_operations:
             self.postings.bulk_write(posting_operations, ordered=False)
 
+        state_operations = []
+        for document, doc_postings in zip(documents, mapped_batch):
+            term_counts = {
+                term: int(posting['term_frequency'])
+                for term, posting in doc_postings.items()
+            }
+            state_operations.append(UpdateOne(
+                {'url': document['url']},
+                {
+                    '$set': {
+                        'url': document['url'],
+                        'page_id': document.get('page_id'),
+                        'title': document.get('title', ''),
+                        'term_counts': term_counts,
+                        'doc_length': sum(term_counts.values()),
+                        'last_indexed_version': str(document.get('crawl_version', '')),
+                        'indexed_at': now,
+                    },
+                    '$setOnInsert': {'created_at': now},
+                },
+                upsert=True,
+            ))
+        if state_operations:
+            self.state.bulk_write(state_operations, ordered=False)
+
         self.documents.update_many(
-            {'_id': {'$in': document_ids}},
+            {'_id': {'$in': [document['_id'] for document in documents]}},
             {'$set': {'indexed_at': now}}
         )
 

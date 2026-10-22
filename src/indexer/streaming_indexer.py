@@ -202,6 +202,11 @@ class StreamingIndexer:
 
                     old_counts = self._old_term_counts(url, session=session)
                     new_counts = self._term_counts(document)
+                    # BM25 needs each document's length and whether a term
+                    # appears in the title; both are denormalized onto the
+                    # postings so search scores them without a join.
+                    doc_length = sum(new_counts.values())
+                    title_terms = set(self.tokenizer.tokenize(document.get('title', '')))
                     changed_terms = sorted(set(old_counts) | set(new_counts))
                     now = datetime.utcnow()
 
@@ -230,6 +235,8 @@ class StreamingIndexer:
                                         'url': url,
                                         'title': document.get('title', ''),
                                         'term_frequency': int(count),
+                                        'doc_length': doc_length,
+                                        'in_title': term in title_terms,
                                         'updated_at': now,
                                     },
                                     '$setOnInsert': {'created_at': now},
@@ -253,6 +260,7 @@ class StreamingIndexer:
                                 'page_id': document.get('page_id'),
                                 'title': document.get('title', ''),
                                 'term_counts': new_counts,
+                                'doc_length': doc_length,
                                 'last_indexed_version': crawl_version,
                                 'indexed_at': now,
                             },

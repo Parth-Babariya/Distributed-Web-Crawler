@@ -239,6 +239,10 @@ curl.exe "http://localhost:8000/search?q=football&limit=5"
 curl.exe "http://localhost:8000/search?q=music&limit=5"
 ```
 
+Add `&mode=all` to return only pages that contain every query term (default
+`mode=any`). Each result reports its BM25 `term_score`, PageRank
+`authority_score`, combined `score`, and `matched_terms`.
+
 If these words are not in the crawled pages, list indexed terms:
 
 ```powershell
@@ -585,7 +589,9 @@ Important formulas:
 | Throughput | `pages_per_second = crawled_pages / total_time_seconds` |
 | Speedup | `speedup_N = time_1_worker / time_N_workers` |
 | Parallel efficiency | `efficiency_N = speedup_N / N` |
-| Search score | `final_score = term_score * pagerank_authority` |
+| Text relevance | Okapi BM25 (`k1=1.2`, `b=0.75`), x1.5 when the term is in the title |
+| Search score | `score = bm25 * (1 + 0.5 * ln(1 + pagerank / (1 - d)))` |
+| PageRank | Unnormalized: `x = (1-d) + d * sum(x_in / outdeg_in)`; a page with no in-links has rank `1-d` |
 | PageRank convergence | Stop when L1 rank-vector change is below epsilon. |
 
 ## Troubleshooting

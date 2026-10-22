@@ -270,6 +270,9 @@ class CoreCrawlerTests(unittest.TestCase):
                 self.pipeline = None
                 self.allow_disk_use = False
 
+            def count_documents(self, query):
+                return 1
+
             def aggregate(self, pipeline, allowDiskUse=False):
                 self.pipeline = pipeline
                 self.allow_disk_use = allowDiskUse
@@ -280,8 +283,13 @@ class CoreCrawlerTests(unittest.TestCase):
                         'score': 2.0,
                         'term_score': 2,
                         'authority_score': 1.0,
+                        'matched_terms': ['crawl'],
                     }
                 ])
+
+        class FakeIndexedDocuments:
+            def aggregate(self, pipeline):
+                return iter([{'_id': None, 'doc_count': 10, 'avg_doc_length': 50.0}])
 
         class FakeDocuments:
             def __init__(self):
@@ -294,6 +302,7 @@ class CoreCrawlerTests(unittest.TestCase):
         service = SearchService.__new__(SearchService)
         service.postings = FakePostings()
         service.documents = FakeDocuments()
+        service.indexed_documents = FakeIndexedDocuments()
         service.indexer = MapReduceIndexer.__new__(MapReduceIndexer)
 
         response = service.search('crawler', limit=1)
