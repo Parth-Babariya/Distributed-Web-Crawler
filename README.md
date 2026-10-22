@@ -41,7 +41,7 @@ Run it after the automatic Docker run, or run the Docker flow again afterward.
 
 ```yaml
 crawler-worker:
-  command: ["python", "src/v3/worker_v3.py", "--max-pages", "30", "--idle-timeout", "120", "--batch-size", "5"]
+  command: ["python", "src/v3/worker_v3.py", "--max-pages", "30", "--idle-timeout", "120", "--batch-size", "5", "--concurrency", "8"]
   restart: "no"
 ```
 
@@ -52,6 +52,7 @@ Meaning:
 | `--max-pages 30` | Each crawler container stores at most 30 pages, then exits. |
 | `--idle-timeout 120` | If no crawlable URL appears for 120 seconds, the worker exits. |
 | `--batch-size 5` | Pages are saved in small transaction batches. |
+| `--concurrency 8` | Up to 8 page fetches in flight per worker, each on a different domain (politeness still allows one request per domain at a time). |
 | `restart: "no"` | Docker does not restart a worker after it finishes. |
 
 If you run three workers, the system can store up to roughly `3 x 30 = 90`

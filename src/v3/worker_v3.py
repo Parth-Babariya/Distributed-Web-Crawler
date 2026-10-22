@@ -20,6 +20,8 @@ import random
 import sys
 import os
 import asyncio
+import threading
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -110,9 +112,9 @@ def _check_declared_length(headers, max_bytes: int):
 class AiohttpPageFetcher:
     """Persistent aiohttp fetcher with DNS cache and connection pooling.
 
-    The crawler loop is still synchronous, so this object owns a private event
-    loop and runs one fetch coroutine at a time. Even without concurrent page
-    fetches, the persistent ClientSession keeps TCP pools and DNS cache hot
+    The event loop runs on its own daemon thread. ``fetch`` is a blocking,
+    thread-safe call, so the worker's fetch threads can all multiplex their
+    requests over one ClientSession whose TCP pools and DNS cache stay hot
     across many crawls.
     """
 
@@ -128,6 +130,12 @@ class AiohttpPageFetcher:
         self.max_bytes = max_bytes
         self.loop = asyncio.new_event_loop()
         self.session = None
+        self._loop_thread = threading.Thread(
+            target=self.loop.run_forever,
+            name='aiohttp-page-fetcher',
+            daemon=True,
+        )
+        self._loop_thread.start()
 
     async def _ensure_session(self):
         if self.session is not None and not self.session.closed:
@@ -186,12 +194,19 @@ class AiohttpPageFetcher:
             )
 
     def fetch(self, url: str, user_agent: str) -> PageFetchResult:
-        return self.loop.run_until_complete(self._fetch(url, user_agent))
+        # The ClientTimeout above bounds how long this can block.
+        return asyncio.run_coroutine_threadsafe(
+            self._fetch(url, user_agent), self.loop
+        ).result()
+
+    async def _close_session(self):
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
 
     def close(self):
-        if self.session is not None and not self.session.closed:
-            self.loop.run_until_complete(self.session.close())
-        self.loop.run_until_complete(asyncio.sleep(0))
+        asyncio.run_coroutine_threadsafe(self._close_session(), self.loop).result(timeout=10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._loop_thread.join(timeout=10)
         self.loop.close()
 
 
@@ -230,19 +245,23 @@ class DecentralizedWorker:
                  mongodb_uri: str = None,
                  batch_size: int = 50,
                  processing_timeout: int = 300,
-                 recovery_interval: int = None):
+                 recovery_interval: int = None,
+                 concurrency: int = None):
         """
         Initialize decentralized worker.
-        
+
         Args:
             worker_id: Unique worker identifier
             redis_host: Redis host
             redis_port: Redis port
             mongodb_uri: MongoDB connection URI
             batch_size: Pages to batch before MongoDB insert
+            concurrency: Max page fetches in flight (each on a different
+                domain, since the politeness lock admits one per domain)
         """
         import uuid
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
+        self.concurrency = max(1, concurrency or CrawlerConfig.FETCH_CONCURRENCY)
         redis_host = redis_host or CrawlerConfig.REDIS_HOST
         redis_port = redis_port or CrawlerConfig.REDIS_PORT
         mongodb_uri = mongodb_uri or CrawlerConfig.get_mongo_url()
@@ -1070,8 +1089,17 @@ class DecentralizedWorker:
         logger.info(f"[{self.worker_id}] Starting decentralized worker...")
         logger.info(f"  Max pages: {max_pages or 'unlimited'}")
         logger.info(f"  Idle timeout: {idle_timeout}s")
-        
+        logger.info(f"  Fetch concurrency: {self.concurrency}")
+
         idle_since = None
+        # Fetches run on a thread pool; everything that touches Redis, Mongo
+        # or worker state (claiming, parsing, link enqueue, batching, lease
+        # release) stays on this thread when a fetch completes.
+        in_flight: Dict[Future, Dict] = {}
+        fetch_pool = ThreadPoolExecutor(
+            max_workers=self.concurrency,
+            thread_name_prefix=f'{self.worker_id}-fetch',
+        )
 
         try:
             while self.running:
@@ -1085,47 +1113,100 @@ class DecentralizedWorker:
                     break
 
                 self.recover_stale_urls()
+                dispatched = self._dispatch_fetches(fetch_pool, in_flight, max_pages)
 
-                # Pull URL from frontier (two-tier: pop a domain, then a URL).
-                url_data = self.pull_url_from_frontier()
-
-                if not url_data:
-                    # Three reasons we got nothing:
-                    #   - active_domains was empty (no work anywhere)
-                    #   - head domain was locked (push-back already happened)
-                    #   - stale active_domains entry (already cleaned)
-                    # In all cases we just retry; idle detection uses
-                    # active_domain_count + processing as the "is there any
-                    # work pending anywhere" signal.
-                    active_domains = self.frontier.active_domain_count()
-                    processing_size = self.ledger.in_flight_count()
-
-                    if active_domains == 0 and processing_size == 0:
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= idle_timeout:
-                            logger.info(f"[{self.worker_id}] Frontier empty for {idle_timeout}s, stopping")
-                            break
-                    else:
-                        idle_since = None
-
-                    # Short sleep when a locked head domain just got pushed
-                    # back (avoid hot-loop), longer sleep when truly idle.
-                    time.sleep(_LOCKED_SLEEP_SECONDS if active_domains else _IDLE_SLEEP_SECONDS)
+                if in_flight:
+                    idle_since = None
+                    done, _ = wait(
+                        in_flight,
+                        timeout=_LOCKED_SLEEP_SECONDS,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        self._complete_crawl(in_flight.pop(future), self._future_outcome(future))
                     continue
 
-                # Reset idle timer
-                idle_since = None
+                # Nothing in flight. Flush a partial batch now: its URLs hold
+                # leases in the processing ledger, which would otherwise keep
+                # the idle check below from ever firing, and at the max-pages
+                # cap they are what's left to commit.
+                if self.storage.pending_count():
+                    self._maybe_flush(force=True)
+                    continue
 
-                url = url_data['url']
-                logger.info(f"[{self.worker_id}] Crawling: {url}")
-                outcome = self._fetch_outcome(url, self._user_agent_for_url(url))
-                self._complete_crawl(url_data, outcome)
+                if dispatched:
+                    continue
+
+                # We got nothing. Three reasons:
+                #   - active_domains was empty (no work anywhere)
+                #   - head domain was locked (push-back already happened)
+                #   - stale active_domains entry (already cleaned)
+                # In all cases we just retry; idle detection uses
+                # active_domain_count + processing as the "is there any
+                # work pending anywhere" signal.
+                active_domains = self.frontier.active_domain_count()
+                processing_size = self.ledger.in_flight_count()
+
+                if active_domains == 0 and processing_size == 0:
+                    if idle_since is None:
+                        idle_since = time.time()
+                    elif time.time() - idle_since >= idle_timeout:
+                        logger.info(f"[{self.worker_id}] Frontier empty for {idle_timeout}s, stopping")
+                        break
+                else:
+                    idle_since = None
+
+                # Short sleep when a locked head domain just got pushed
+                # back (avoid hot-loop), longer sleep when truly idle.
+                time.sleep(_LOCKED_SLEEP_SECONDS if active_domains else _IDLE_SLEEP_SECONDS)
 
         except KeyboardInterrupt:
             logger.info(f"[{self.worker_id}] Interrupted by user")
         finally:
+            # Finish fetches already started so their URLs are stored or
+            # re-queued now instead of waiting out their leases.
+            for future in list(in_flight):
+                self._complete_crawl(in_flight.pop(future), self._future_outcome(future))
+            fetch_pool.shutdown(wait=True)
             self._shutdown()
+
+    def _dispatch_fetches(self, fetch_pool: ThreadPoolExecutor,
+                          in_flight: Dict[Future, Dict],
+                          max_pages: Optional[int]) -> int:
+        """Claim URLs and start fetching them until every slot is busy.
+
+        Stops at the first empty/locked pull rather than spinning through
+        the frontier; the loop comes back within _LOCKED_SLEEP_SECONDS.
+        Pages already fetched, batched or in flight count toward max_pages
+        so the worker does not overshoot its cap by `concurrency` pages.
+        """
+        slots = self.concurrency - len(in_flight)
+        if max_pages:
+            projected = (
+                self.stats['pages_crawled']
+                + self.storage.pending_count()
+                + len(in_flight)
+            )
+            slots = min(slots, max_pages - projected)
+
+        dispatched = 0
+        while dispatched < slots:
+            url_data = self.pull_url_from_frontier()
+            if not url_data:
+                break
+            url = url_data['url']
+            logger.info(f"[{self.worker_id}] Crawling: {url}")
+            future = fetch_pool.submit(self._fetch_outcome, url, self._user_agent_for_url(url))
+            in_flight[future] = url_data
+            dispatched += 1
+        return dispatched
+
+    @staticmethod
+    def _future_outcome(future: Future) -> FetchOutcome:
+        try:
+            return future.result()
+        except Exception as e:  # _fetch_outcome catches everything; belt and braces
+            return FetchOutcome(error=f'error: {e}')
     
     def _shutdown(self):
         """Cleanup and show statistics."""
@@ -1190,6 +1271,7 @@ def main():
     parser.add_argument('--idle-timeout', type=int, default=60, help='Idle timeout seconds')
     parser.add_argument('--processing-timeout', type=int, default=300, help='Seconds before stale processing URLs are recovered')
     parser.add_argument('--recovery-interval', type=int, default=CrawlerConfig.RECOVERY_INTERVAL, help='Min seconds between stale-recovery sweeps')
+    parser.add_argument('--concurrency', type=int, default=CrawlerConfig.FETCH_CONCURRENCY, help='Max concurrent page fetches (one per domain)')
 
     args = parser.parse_args()
 
@@ -1202,6 +1284,7 @@ def main():
         batch_size=args.batch_size,
         processing_timeout=args.processing_timeout,
         recovery_interval=args.recovery_interval,
+        concurrency=args.concurrency,
     )
     
     worker.start(max_pages=args.max_pages, idle_timeout=args.idle_timeout)

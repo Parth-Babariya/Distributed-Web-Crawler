@@ -43,6 +43,7 @@ class CrawlerConfig:
     
     # Worker Configuration
     MAX_PAGES_PER_WORKER = int(os.getenv('MAX_PAGES_PER_WORKER', 0))  # 0 = unlimited
+    FETCH_CONCURRENCY = int(os.getenv('FETCH_CONCURRENCY', 8))  # in-flight fetches per worker
     WORKER_IDLE_SLEEP = int(os.getenv('WORKER_IDLE_SLEEP', 5))
     
     # URL Filtering

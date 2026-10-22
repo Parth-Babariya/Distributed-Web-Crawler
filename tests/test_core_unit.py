@@ -181,6 +181,43 @@ class CoreCrawlerTests(unittest.TestCase):
 
         self.assertEqual(worker.frontier.enqueued, ['http://example.com/flaky'])
 
+    def test_dispatch_counts_batched_and_in_flight_pages_toward_max_pages(self):
+        class Storage:
+            def pending_count(self):
+                return 2
+
+        class Pool:
+            def __init__(self):
+                self.submitted = []
+
+            def submit(self, fn, url, user_agent):
+                self.submitted.append(url)
+                return object()
+
+        urls = iter([{'url': f'http://site{i}.test/'} for i in range(10)])
+        worker = DecentralizedWorker.__new__(DecentralizedWorker)
+        worker.worker_id = 'unit-test'
+        worker.concurrency = 4
+        worker.stats = {'pages_crawled': 5}
+        worker.storage = Storage()
+        worker.domain_user_agents = {}
+        worker._random_user_agent = lambda: 'ua'
+        worker.pull_url_from_frontier = lambda: next(urls)
+        pool = Pool()
+        in_flight = {object(): {'url': 'http://busy.test/'}}
+
+        # 5 stored + 2 batched + 1 in flight leaves room for 1 more under 9.
+        self.assertEqual(worker._dispatch_fetches(pool, in_flight, max_pages=9), 1)
+        # Without a cap, the remaining concurrency slots are filled.
+        self.assertEqual(worker._dispatch_fetches(pool, in_flight, max_pages=None), 2)
+        self.assertEqual(len(in_flight), 4)
+
+    def test_dispatch_stops_at_first_empty_pull(self):
+        worker = DecentralizedWorker.__new__(DecentralizedWorker)
+        worker.concurrency = 8
+        worker.pull_url_from_frontier = lambda: None
+        self.assertEqual(worker._dispatch_fetches(None, {}, max_pages=None), 0)
+
     def test_user_agent_is_stable_per_domain(self):
         worker = DecentralizedWorker.__new__(DecentralizedWorker)
         worker.domain_user_agents = {}
