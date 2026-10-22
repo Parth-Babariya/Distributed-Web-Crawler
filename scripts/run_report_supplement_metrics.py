@@ -16,6 +16,7 @@ provenance explicitly.
 """
 
 import csv
+import json
 import math
 import os
 import statistics
@@ -439,19 +440,90 @@ def run_pagerank_convergence_experiment(max_iterations=50, epsilon=1e-8):
     client = MongoClient(MONGO_URI)
     db = client[DATABASE_NAME]
 
-    worker = IncrementalPageRankWorker(
-        mongodb_uri=MONGO_URI,
-        database=DATABASE_NAME,
-        worker_id="report-convergence-pagerank",
-        claim_timeout_seconds=5,
-    )
-    try:
-        for _ in range(100):
+    class FifoPageRankWorker(IncrementalPageRankWorker):
+        """The previous claim order: oldest last_updated first."""
+
+        def claim_residual_node(self):
+            return self.nodes.find_one_and_update(
+                {
+                    "residual_claimed_at": {"$exists": False},
+                    "$or": [
+                        {"residual": {"$gt": self.epsilon}},
+                        {"residual": {"$lt": -self.epsilon}},
+                    ],
+                },
+                {"$set": {"residual_claimed_at": datetime.utcnow(),
+                          "residual_worker_id": self.worker_id}},
+                sort=[("last_updated", ASCENDING)],
+            )
+
+    def drain(worker, cap_seconds):
+        """Process every graph event and push until no residual exceeds epsilon."""
+        started = time.perf_counter()
+        pushes_total = 0
+        converged = True
+        while True:
             events = worker.process_pending_events(max_events=250)
-            pushes = worker.propagate_residuals(max_pushes=250)
+            pushes = worker.propagate_residuals(max_pushes=500)
+            pushes_total += pushes
             if not events and not pushes:
                 break
-    finally:
+            if time.perf_counter() - started > cap_seconds:
+                converged = False
+                break
+        pending = db.pagerank_nodes.count_documents({"$or": [
+            {"residual": {"$gt": worker.epsilon}},
+            {"residual": {"$lt": -worker.epsilon}},
+        ]})
+        return {
+            "residual_pushes": pushes_total,
+            "drain_seconds": time.perf_counter() - started,
+            "converged": converged and pending == 0,
+            "nodes_with_pending_residual": pending,
+        }
+
+    def replay_graph_events():
+        """Reset PageRank state so the same event stream can be replayed."""
+        db.graph_edges.delete_many({})
+        db.pagerank_nodes.delete_many({})
+        db.graph_outbox.update_many(
+            {},
+            {"$set": {"status": "pending"},
+             "$unset": {"claimed_at": "", "worker_id": "", "done_at": "", "skipped_reason": ""}},
+        )
+
+    # Replay the measured crawl's graph events under both claim orders; the
+    # largest-residual order runs last so its state is what gets compared
+    # against power iteration below.
+    scheduler_rows = []
+    worker = None
+    if db.graph_outbox.count_documents({}):
+        for label, worker_cls in (("fifo_last_updated", FifoPageRankWorker),
+                                  ("largest_residual_first", IncrementalPageRankWorker)):
+            replay_graph_events()
+            worker = worker_cls(
+                mongodb_uri=MONGO_URI,
+                database=DATABASE_NAME,
+                worker_id=f"report-{label}",
+                claim_timeout_seconds=5,
+            )
+            result = drain(worker, cap_seconds=900)
+            result.update({
+                "scheduler": label,
+                "graph_events": db.graph_outbox.count_documents({}),
+                "nodes": db.pagerank_nodes.count_documents({}),
+            })
+            scheduler_rows.append(result)
+            print(json.dumps(result))
+            worker.close()
+        write_csv(PROCESSED_DIR / "pagerank_scheduler_comparison.csv", scheduler_rows)
+    if worker is None:
+        worker = IncrementalPageRankWorker(
+            mongodb_uri=MONGO_URI,
+            database=DATABASE_NAME,
+            worker_id="report-convergence-pagerank",
+            claim_timeout_seconds=5,
+        )
         worker.close()
 
     edge_docs = list(db.graph_edges.find({}, {"source_url": 1, "outbound_urls": 1}))
@@ -475,26 +547,18 @@ def run_pagerank_convergence_experiment(max_iterations=50, epsilon=1e-8):
         nodes.add(src)
         nodes.update(links)
 
-    damping = 0.85
-    personalization = {url: 1.0 / len(nodes) for url in nodes}
-    ranks = dict(personalization)
+    # Iterate the same unnormalized equation the PageRank worker maintains
+    # incrementally (teleport 1-d per node, dangling rank dropped), recording
+    # the L1 change per iteration.
+    teleport = {url: worker.teleport_mass(url) for url in nodes}
+    ranks = dict(teleport)
     rows = []
 
     for iteration in range(1, max_iterations + 1):
-        new_ranks = {
-            url: (1.0 - damping) * personalization[url]
-            for url in nodes
-        }
-        dangling_mass = sum(rank for url, rank in ranks.items() if not outgoing.get(url))
-        for url, weight in personalization.items():
-            new_ranks[url] += damping * dangling_mass * weight
-
-        for src, links in outgoing.items():
-            if not links:
-                continue
-            contribution = damping * ranks[src] / len(links)
-            for dst in links:
-                new_ranks[dst] += contribution
+        new_ranks = dict(teleport)
+        for src in nodes:
+            for dst, mass in worker._outflow(ranks[src], outgoing.get(src, [])).items():
+                new_ranks[dst] = new_ranks.get(dst, 0.0) + mass
 
         l1_delta = sum(abs(new_ranks[url] - ranks[url]) for url in nodes)
         rows.append({
@@ -502,13 +566,35 @@ def run_pagerank_convergence_experiment(max_iterations=50, epsilon=1e-8):
             "l1_delta": l1_delta,
             "nodes": len(nodes),
             "edges": sum(len(v) for v in outgoing.values()),
-            "damping": damping,
+            "damping": worker.damping,
             "epsilon": epsilon,
             "source": source,
         })
         ranks = new_ranks
         if l1_delta < epsilon:
             break
+
+    # How far the incrementally maintained ranks are from the converged
+    # power-iteration answer on the same graph.
+    if source == "measured_graph_edges_snapshot":
+        incremental = {
+            doc["url"]: float(doc.get("rank", 0.0))
+            for doc in db.pagerank_nodes.find({}, {"url": 1, "rank": 1})
+        }
+        shared = [url for url in nodes if url in incremental]
+        diffs = [abs(incremental[url] - ranks[url]) for url in shared]
+        consistency = {
+            "nodes_compared": len(shared),
+            "max_abs_diff": max(diffs) if diffs else 0.0,
+            "mean_abs_diff": statistics.mean(diffs) if diffs else 0.0,
+            "max_rank": max(ranks.values()) if ranks else 0.0,
+            "residual_epsilon": worker.epsilon,
+            "power_iterations": len(rows),
+            **({k: v for k, v in scheduler_rows[-1].items() if k != "scheduler"} if scheduler_rows else {}),
+        }
+        (PROCESSED_DIR / "pagerank_incremental_vs_recompute.json").write_text(
+            json.dumps(consistency, indent=2), encoding="utf-8"
+        )
 
     write_csv(PROCESSED_DIR / "pagerank_convergence.csv", rows)
     client.close()

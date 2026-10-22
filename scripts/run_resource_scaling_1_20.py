@@ -27,6 +27,7 @@ from run_evaluation_experiments import (
     frontier_total,
     parse_worker_stats,
     run_command,
+    CRAWL_DEADLINE_SECONDS,
     serve_fixture,
     start_all_fixture_servers,
     stop_all_fixture_servers,
@@ -78,6 +79,10 @@ def run_one(worker_count, redis_client, db):
                 "5",
                 "--processing-timeout",
                 "2",
+                # Match the worker-count scaling experiment (see
+                # SCALING_CONCURRENCY in run_evaluation_experiments.py).
+                "--concurrency",
+                "1",
             ],
             cwd=PROJECT_ROOT,
             env=env(),
@@ -116,7 +121,7 @@ def run_one(worker_count, redis_client, db):
         if db.pages_metadata.count_documents({}) >= TARGET_PAGES:
             redis_client.set("crawler:shutdown", "1", ex=30)
             stop_at = time.perf_counter()
-        if stop_at is None and time.perf_counter() - started > 90:
+        if stop_at is None and time.perf_counter() - started > CRAWL_DEADLINE_SECONDS:
             stop_at = time.perf_counter()
             redis_client.set("crawler:shutdown", "1", ex=30)
             for process in alive:

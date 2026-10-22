@@ -28,6 +28,12 @@ def as_float(row, key):
     return float(row[key])
 
 
+def crawl_rate(row):
+    """Steady-state pages/s when measured, else wall-clock pages/s."""
+    value = row.get('steady_pages_per_second')
+    return float(value) if value not in (None, '') else as_float(row, 'pages_per_second')
+
+
 def style_axes(ax):
     ax.grid(True, alpha=0.25)
     ax.spines['top'].set_visible(False)
@@ -60,8 +66,8 @@ def plot_scaling(rows):
     savefig('crawl_time_vs_workers')
 
     fig, ax = plt.subplots(figsize=(7.2, 4.4))
-    ax.plot(workers, [as_float(row, 'pages_per_second') for row in rows], marker='o', linewidth=2, color='#1f77b4')
-    ax.set_title('Crawl Throughput vs Worker Count')
+    ax.plot(workers, [crawl_rate(row) for row in rows], marker='o', linewidth=2, color='#1f77b4')
+    ax.set_title('Steady-State Crawl Throughput vs Worker Count')
     ax.set_xlabel('Number of worker processes')
     ax.set_ylabel('Pages crawled per second')
     ax.set_xticks(workers)
@@ -74,7 +80,7 @@ def plot_scaling(rows):
     ax.plot(workers, workers, linestyle='--', color='gray', label='Ideal linear speedup')
     ax.set_title('Measured Speedup Relative to One Worker')
     ax.set_xlabel('Number of worker processes')
-    ax.set_ylabel('Speedup (T1 / TN)')
+    ax.set_ylabel('Speedup (throughput_N / throughput_1)')
     ax.set_xticks(workers)
     ax.legend()
     style_axes(ax)
@@ -98,6 +104,37 @@ def plot_scaling(rows):
     ax.set_xticks(workers)
     style_axes(ax)
     savefig('duplicates_filtered_vs_workers')
+
+
+def plot_concurrency(rows):
+    if not rows:
+        return
+    levels = [int(float(row['concurrency_per_worker'])) for row in rows]
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    ax.plot(levels, [crawl_rate(row) for row in rows], marker='o', linewidth=2, color='#1f77b4')
+    ax.set_title('One Worker: Throughput vs In-Flight Fetches')
+    ax.set_xlabel('In-flight fetches per worker (--concurrency)')
+    ax.set_ylabel('Pages crawled per second')
+    ax.set_xscale('log', base=2)
+    ax.set_xticks(levels)
+    ax.set_xticklabels([str(level) for level in levels])
+    style_axes(ax)
+    savefig('throughput_vs_concurrency')
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    ax.plot(levels, [as_float(row, 'speedup') for row in rows], marker='o', linewidth=2, label='Measured speedup')
+    ax.plot(levels, levels, linestyle='--', color='gray', label='Ideal linear speedup')
+    ax.set_title('One Worker: Speedup vs In-Flight Fetches')
+    ax.set_xlabel('In-flight fetches per worker (--concurrency)')
+    ax.set_ylabel('Speedup (throughput_c / throughput_1)')
+    ax.set_xscale('log', base=2)
+    ax.set_yscale('log', base=2)
+    ax.set_xticks(levels)
+    ax.set_xticklabels([str(level) for level in levels])
+    ax.legend()
+    style_axes(ax)
+    savefig('speedup_vs_concurrency')
 
 
 def plot_worker_distribution(rows):
@@ -202,16 +239,16 @@ def plot_fault_tolerance(rows, scaling_rows):
     if not rows:
         return
     fault = rows[0]
-    baseline = next((row for row in scaling_rows if int(row['workers']) == 4), None)
-    labels = ['4 workers\nnormal', '4 workers\none terminated']
-    values = [
-        as_float(baseline, 'crawled_pages') if baseline else 0,
-        as_float(fault, 'completed_pages'),
-    ]
+    # The fault run caps each worker at max_pages_per_worker, so compare
+    # against that capacity rather than against an uncapped scaling run.
+    workers = int(float(fault['workers_started']))
+    per_worker = int(float(fault.get('max_pages_per_worker') or 20))
+    labels = [f'Capacity\n({workers} workers x {per_worker} pages)', 'Completed\n(one worker killed)']
+    values = [workers * per_worker, as_float(fault, 'completed_pages')]
 
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     ax.bar(labels, values, color=['#1f77b4', '#ff7f0e'])
-    ax.set_title('Fault-Tolerance Crawl Completion')
+    ax.set_title('Fault Tolerance: Pages Completed After a Worker Is Killed')
     ax.set_ylabel('Completed pages')
     style_axes(ax)
     savefig('fault_tolerance_completed_pages')
@@ -395,6 +432,11 @@ def write_report_tables():
     """Write data-backed LaTeX tables consumed by report/main.tex."""
     report_path = PROJECT_ROOT / 'report' / 'generated_results.tex'
     scaling = read_csv(PROCESSED_DIR / 'crawl_scaling.csv') if (PROCESSED_DIR / 'crawl_scaling.csv').exists() else []
+    concurrency = read_csv(PROCESSED_DIR / 'concurrency_scaling.csv') if (PROCESSED_DIR / 'concurrency_scaling.csv').exists() else []
+    consistency_path = PROCESSED_DIR / 'pagerank_incremental_vs_recompute.json'
+    consistency = read_json(consistency_path) if consistency_path.exists() else {}
+    scheduler_path = PROCESSED_DIR / 'pagerank_scheduler_comparison.csv'
+    scheduler = read_csv(scheduler_path) if scheduler_path.exists() else []
     indexing = read_csv(PROCESSED_DIR / 'indexing_scaling.csv') if (PROCESSED_DIR / 'indexing_scaling.csv').exists() else []
     queries = read_csv(PROCESSED_DIR / 'query_latency.csv') if (PROCESSED_DIR / 'query_latency.csv').exists() else []
     fault = read_csv(PROCESSED_DIR / 'fault_tolerance.csv') if (PROCESSED_DIR / 'fault_tolerance.csv').exists() else []
@@ -422,10 +464,10 @@ def write_report_tables():
             r'\begin{table}[H]',
             r'\centering',
             r'\small',
-            r'\caption{Crawler worker scaling summary. Full data: \code{results/processed/crawl\_scaling.csv}.}',
+            r'\caption{Crawler worker scaling, one in-flight fetch per worker. Full data: \code{results/processed/crawl\_scaling.csv}.}',
             r'\begin{tabular}{rrrrrr}',
             r'\toprule',
-            r'Workers & Pages & Time (s) & Pages/s & Speedup & Efficiency \\',
+            r'Workers & Pages & Wall time (s) & Steady pages/s & Speedup & Efficiency \\',
             r'\midrule',
         ])
         for row in select_worker_rows(scaling):
@@ -433,7 +475,7 @@ def write_report_tables():
                 f"{int(float(row['workers']))} & "
                 f"{int(float(row['crawled_pages']))} & "
                 f"{fnum(row['total_time_seconds'])} & "
-                f"{fnum(row['pages_per_second'])} & "
+                f"{fnum(crawl_rate(row))} & "
                 f"{fnum(row['speedup'])} & "
                 f"{fnum(row['parallel_efficiency'])} \\\\"
             )
@@ -444,14 +486,37 @@ def write_report_tables():
             r'\end{table}',
             (
                 r'\noindent\textbf{Worked scaling calculation.} '
-                f"For {int(float(example['workers']))} workers, throughput is "
-                f"${int(float(example['crawled_pages']))}/{fnum(example['total_time_seconds'])}"
-                f" = {fnum(example['pages_per_second'])}$ pages/s. "
-                f"Using the one-worker baseline $T_1={fnum(baseline['total_time_seconds'])}$ s, "
-                f"speedup is $T_1/T_N={fnum(example['speedup'])}$ and parallel efficiency is "
+                f"Steady-state throughput counts the pages stored between the 10th and 90th "
+                f"percentile of page timestamps, so worker start-up and shutdown are excluded. "
+                f"For {int(float(example['workers']))} workers it is "
+                f"{fnum(crawl_rate(example))} pages/s over a {fnum(example.get('steady_window_seconds', 0))} s window. "
+                f"Against the one-worker {fnum(crawl_rate(baseline))} pages/s, "
+                f"speedup is {fnum(example['speedup'])} and parallel efficiency is "
                 f"$\\mathrm{{speedup}}/N={fnum(example['parallel_efficiency'])}$."
             ),
         ])
+
+    if concurrency:
+        lines.extend([
+            r'\begin{table}[H]',
+            r'\centering',
+            r'\small',
+            r'\caption{One worker with increasing in-flight fetches. Full data: \code{results/processed/concurrency\_scaling.csv}.}',
+            r'\begin{tabular}{rrrrrr}',
+            r'\toprule',
+            r'In-flight & Pages & Wall time (s) & Steady pages/s & Speedup & Efficiency \\',
+            r'\midrule',
+        ])
+        for row in concurrency:
+            lines.append(
+                f"{int(float(row['concurrency_per_worker']))} & "
+                f"{int(float(row['crawled_pages']))} & "
+                f"{fnum(row['total_time_seconds'])} & "
+                f"{fnum(crawl_rate(row))} & "
+                f"{fnum(row['speedup'])} & "
+                f"{fnum(row['parallel_efficiency'])} \\\\"
+            )
+        lines.extend([r'\bottomrule', r'\end{tabular}', r'\normalsize', r'\end{table}'])
 
     if indexing:
         lines.extend([
@@ -534,11 +599,46 @@ def write_report_tables():
             f"Edges & {int(float(final['edges']))} & graph snapshot \\\\",
             f"Iterations & {int(float(final['iteration']))} & stopped at epsilon/max \\\\",
             f"Final L1 delta & {fnum(final['l1_delta'], 8)} & epsilon {fnum(final['epsilon'], 8)} \\\\",
+        ])
+        if consistency:
+            lines.extend([
+                f"Nodes compared & {int(consistency['nodes_compared'])} & incremental vs.\\ recompute \\\\",
+                f"Max $|x_{{inc}} - x_{{pi}}|$ & {fnum(consistency['max_abs_diff'], 8)} & push threshold {fnum(consistency['residual_epsilon'], 8)} \\\\",
+                f"Mean $|x_{{inc}} - x_{{pi}}|$ & {fnum(consistency['mean_abs_diff'], 8)} & across compared nodes \\\\",
+                f"Largest rank & {fnum(consistency['max_rank'], 4)} & base rank $1-d = 0.15$ \\\\",
+            ])
+        lines.extend([
             r'\bottomrule',
             r'\end{tabular}',
             r'\normalsize',
             r'\end{table}',
         ])
+
+    if scheduler:
+        names = {
+            'fifo_last_updated': 'Oldest update first (previous)',
+            'largest_residual_first': 'Largest residual first (current)',
+        }
+        lines.extend([
+            r'\begin{table}[H]',
+            r'\centering',
+            r'\small',
+            r'\caption{Residual-push scheduling on the same replayed graph-event stream. Full data: \code{pagerank\_scheduler\_comparison.csv}.}',
+            r'\label{tab:pagerank-scheduler}',
+            r'\begin{tabular}{lrrrr}',
+            r'\toprule',
+            r'Claim order & Pushes & Seconds & Converged & Nodes still pending \\',
+            r'\midrule',
+        ])
+        for row in scheduler:
+            lines.append(
+                f"{names.get(row['scheduler'], latex_escape(row['scheduler']))} & "
+                f"{int(float(row['residual_pushes']))} & "
+                f"{fnum(row['drain_seconds'], 1)} & "
+                f"{'yes' if row['converged'] == 'True' else 'no (cap)'} & "
+                f"{int(float(row['nodes_with_pending_residual']))} \\\\"
+            )
+        lines.extend([r'\bottomrule', r'\end{tabular}', r'\normalsize', r'\end{table}'])
 
     if fault:
         row = fault[0]
@@ -602,14 +702,17 @@ These files are generated from real local experiments against the current Docker
 ## Data files
 
 - `results/raw/evaluation_results.json`: combined raw JSON output from the experiment run.
-- `results/processed/crawl_scaling.csv`: worker-count scaling measurements from independent worker subprocesses.
+- `results/processed/crawl_scaling.csv`: worker-count scaling measurements from independent worker subprocesses (one in-flight fetch each).
+- `results/processed/concurrency_scaling.csv`: one worker with 1-16 in-flight fetches.
 - `results/processed/worker_contribution.csv`: per-worker page counts from scaling runs.
 - `results/processed/indexing_scaling.csv`: streaming-indexer drain time and index-size measurements.
 - `results/processed/streaming_indexer_lag.csv`: index_outbox lag while the real streaming indexer drains events.
 - `results/processed/pagerank_convergence.csv`: L1 delta per PageRank power-iteration pass.
+- `results/processed/pagerank_incremental_vs_recompute.json`: gap between incrementally maintained and recomputed ranks on the measured graph.
+- `results/processed/pagerank_scheduler_comparison.csv`: residual pushes and time to converge under the previous (oldest-update-first) and current (largest-residual-first) claim orders, on the same replayed events.
 - `results/processed/query_latency.csv`: FastAPI search latency over repeated HTTP requests.
 - `results/processed/search_correctness.json`: deterministic streaming index/search correctness validation.
-- `results/processed/fault_tolerance.csv`: one-worker-terminated experiment result.
+- `results/processed/fault_tolerance.csv`: one-worker-killed experiment result.
 - `results/processed/bloom_memory_calculation.csv`: Bloom filter formula output and exact-set memory baseline.
 - `results/processed/memory_efficiency.csv`: Bloom versus exact-set memory comparison for graphing.
 - `results/processed/redis_latency.csv`: Redis frontier, Bloom, lock, and robots-cache operation latency.
@@ -624,10 +727,10 @@ Figures in `results/figures/` and `report/figures/` are generated only from the 
 
 ## Reproduction
 
-Start Redis and MongoDB first:
+Start Redis, MongoDB and the S3 store first:
 
 ```powershell
-docker compose up -d
+docker compose up -d redis mongodb s3
 ```
 
 Run experiments:
@@ -663,6 +766,7 @@ def main():
     workers = read_csv(PROCESSED_DIR / 'worker_contribution.csv')
     indexing = read_csv(PROCESSED_DIR / 'indexing_scaling.csv')
     queries = read_csv(PROCESSED_DIR / 'query_latency.csv')
+    concurrency = read_csv(PROCESSED_DIR / 'concurrency_scaling.csv') if (PROCESSED_DIR / 'concurrency_scaling.csv').exists() else []
     fault = read_csv(PROCESSED_DIR / 'fault_tolerance.csv')
     memory = read_csv(PROCESSED_DIR / 'memory_efficiency.csv') if (PROCESSED_DIR / 'memory_efficiency.csv').exists() else []
     mongo_latency = read_csv(PROCESSED_DIR / 'mongodb_latency.csv') if (PROCESSED_DIR / 'mongodb_latency.csv').exists() else []
@@ -673,6 +777,7 @@ def main():
     pagerank_convergence = read_csv(PROCESSED_DIR / 'pagerank_convergence.csv') if (PROCESSED_DIR / 'pagerank_convergence.csv').exists() else []
 
     plot_scaling(scaling)
+    plot_concurrency(concurrency)
     plot_worker_distribution(workers)
     plot_indexing(indexing)
     plot_query_latency(queries)

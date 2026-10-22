@@ -36,8 +36,19 @@ WEB_BASE_PORT = 9292
 DOMAIN_COUNT = 20
 API_PORT = 8020
 PAGE_COUNT = 600
-TARGET_PAGES = 200
+# Large enough that process start-up and shutdown are a small part of each run.
+TARGET_PAGES = 1000
+# Per-page server latency of the fixture. Real crawls are network-bound
+# (tens to hundreds of ms per page); at a few ms the run instead measures
+# per-page CPU/coordination cost, which hides fetch concurrency.
+PAGE_LATENCY_SECONDS = float(os.getenv('EVAL_PAGE_LATENCY_MS', '100')) / 1000
+CRAWL_DEADLINE_SECONDS = 300
 WORKER_COUNTS = list(range(1, 21))
+# Worker-count scaling pins each worker to one in-flight fetch so the curve
+# isolates process-level scaling; the concurrency sweep measures in-worker
+# concurrency separately on a single worker.
+SCALING_CONCURRENCY = 1
+CONCURRENCY_LEVELS = [1, 2, 4, 8, 16]
 INDEX_DOC_COUNTS = [50, 100, 200, 400, 800]
 QUERY_RUNS = 30
 MONGO_URI = os.getenv(
@@ -117,8 +128,8 @@ class EvaluationSiteHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        # Simulate realistic network latency (makes workload I/O-bound)
-        time.sleep(0.01)
+        # Simulate network latency (makes the workload I/O-bound)
+        time.sleep(PAGE_LATENCY_SECONDS)
 
         # Determine which port we are running on for cross-domain links
         host_header = self.headers.get('Host', '')
@@ -366,119 +377,176 @@ def run_command(args, timeout=60):
     )
 
 
+def run_crawl(redis_client, db, workers, concurrency, tag):
+    """One bounded crawl of the fixture: ``workers`` processes, each with
+    ``concurrency`` in-flight fetches, until TARGET_PAGES are stored."""
+    clean_datastores(redis_client, db)
+    # Seed all domains so workers can crawl in parallel across domains
+    seed_urls = [f'http://127.0.0.1:{port}/' for port in range(WEB_BASE_PORT, WEB_BASE_PORT + DOMAIN_COUNT)]
+    run_command([sys.executable, 'src/v3/master_v3.py', 'seed'] + seed_urls)
+
+    processes = []
+    started = time.perf_counter()
+    for index in range(1, workers + 1):
+        worker_id = f'{tag}-{index}'
+        log_path = LOG_DIR / f'{tag}_{worker_id}.log'
+        log_file = log_path.open('w', encoding='utf-8')
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                'src/v3/worker_v3.py',
+                '--worker-id', worker_id,
+                '--max-pages', str(TARGET_PAGES * 10),
+                '--idle-timeout', '12',
+                '--batch-size', '5',
+                '--processing-timeout', '2',
+                '--concurrency', str(concurrency),
+            ],
+            cwd=PROJECT_ROOT,
+            env=env(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        processes.append((process, log_file, log_path, worker_id))
+        time.sleep(0.01)
+
+    deadline = time.perf_counter() + CRAWL_DEADLINE_SECONDS
+    while time.perf_counter() < deadline:
+        metadata_count = db.pages_metadata.count_documents({})
+        alive = [process for process, _, _, _ in processes if process.poll() is None]
+        if metadata_count >= TARGET_PAGES or not alive:
+            break
+        time.sleep(0.1)
+
+    redis_client.set('crawler:shutdown', '1', ex=30)
+
+    for process, log_file, _, _ in processes:
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        log_file.close()
+
+    total_time = time.perf_counter() - started
+    metadata_count = db.pages_metadata.count_documents({})
+    documents_count = db.pages_documents.count_documents({})
+
+    totals = {
+        'links_extracted': 0,
+        'links_added': 0,
+        'links_duplicate': 0,
+        'recovered': 0,
+        'errors': 0,
+        'timeouts': 0,
+    }
+
+    worker_rows = []
+    for _, _, log_path, worker_id in processes:
+        stats = parse_worker_stats(log_path)
+        for key in totals:
+            totals[key] += stats.get(key, 0)
+        worker_rows.append({
+            'experiment_workers': workers,
+            'worker_id': worker_id,
+            'pages_crawled': stats.get('pages_crawled', 0),
+            'links_extracted': stats.get('links_extracted', 0),
+            'links_added': stats.get('links_added', 0),
+            'links_duplicate': stats.get('links_duplicate', 0),
+            'errors': stats.get('errors', 0),
+            'timeouts': stats.get('timeouts', 0),
+        })
+
+    steady = steady_state_throughput(db)
+
+    worker_contrib = list(db.pages_metadata.aggregate([
+        {'$group': {'_id': '$worker_id', 'pages': {'$sum': 1}}},
+        {'$sort': {'_id': 1}},
+    ]))
+
+    row = {
+        'workers': workers,
+        'concurrency_per_worker': concurrency,
+        'target_pages': TARGET_PAGES,
+        'crawled_pages': metadata_count,
+        'documents_stored': documents_count,
+        'total_time_seconds': total_time,
+        'failed_fetch_attempts': totals['errors'] + totals['timeouts'],
+        'duplicate_urls_filtered': totals['links_duplicate'],
+        'links_extracted': totals['links_extracted'],
+        'links_added': totals['links_added'],
+        'recovered_urls': totals['recovered'],
+        'frontier_size_after_run': frontier_total(redis_client),
+        'processing_size_after_run': redis_client.hlen('crawler:processing'),
+        'pages_per_second': metadata_count / total_time if total_time else 0,
+        **steady,
+        'page_latency_ms': PAGE_LATENCY_SECONDS * 1000,
+        'worker_contribution_json': json.dumps(worker_contrib, default=str),
+    }
+    print(json.dumps(row, indent=2))
+    return row, worker_rows
+
+
+def steady_state_throughput(db, low=0.10, high=0.90):
+    """Pages/s between the 10th and 90th percentile of page timestamps.
+
+    Uses each stored page's crawled_at (set when the worker queues it), so
+    process start-up, index creation and shutdown are excluded and the rate
+    reflects the crawl itself. All workers run on one host, so their clocks
+    agree.
+    """
+    stamps = sorted(
+        doc['crawled_at']
+        for doc in db.pages_metadata.find({}, {'crawled_at': 1})
+        if doc.get('crawled_at')
+    )
+    if len(stamps) < 10:
+        return {'steady_pages_per_second': 0.0, 'steady_window_seconds': 0.0}
+    first, last = int(len(stamps) * low), int(len(stamps) * high) - 1
+    window = (stamps[last] - stamps[first]).total_seconds()
+    pages = last - first
+    return {
+        'steady_pages_per_second': pages / window if window > 0 else 0.0,
+        'steady_window_seconds': window,
+    }
+
+
+def add_speedup(rows, unit_key):
+    """Speedup from steady-state throughput, relative to the first row."""
+    baseline = rows[0]['steady_pages_per_second']
+    for row in rows:
+        row['speedup'] = row['steady_pages_per_second'] / baseline if baseline else 0
+        row['parallel_efficiency'] = row['speedup'] / row[unit_key] if row[unit_key] else 0
+
+
 def run_scaling_experiment(redis_client, db):
     rows = []
     worker_rows = []
-
     for workers in WORKER_COUNTS:
         print(f'Running crawl scaling experiment with {workers} workers')
-        clean_datastores(redis_client, db)
-        # Seed all domains so workers can crawl in parallel across domains
-        seed_urls = [f'http://127.0.0.1:{port}/' for port in range(WEB_BASE_PORT, WEB_BASE_PORT + DOMAIN_COUNT)]
-        run_command([sys.executable, 'src/v3/master_v3.py', 'seed'] + seed_urls)
-
-        processes = []
-        started = time.perf_counter()
-        for index in range(1, workers + 1):
-            worker_id = f'eval-{workers}-{index}'
-            log_path = LOG_DIR / f'scaling_w{workers}_{worker_id}.log'
-            log_file = log_path.open('w', encoding='utf-8')
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    'src/v3/worker_v3.py',
-                    '--worker-id', worker_id,
-                    '--max-pages', str(TARGET_PAGES * 10),
-                    '--idle-timeout', '12',
-                    '--batch-size', '5',
-                    '--processing-timeout', '2',
-                ],
-                cwd=PROJECT_ROOT,
-                env=env(),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
-            processes.append((process, log_file, log_path, worker_id))
-            time.sleep(0.01)
-
-        deadline = time.perf_counter() + 90
-        while time.perf_counter() < deadline:
-            metadata_count = db.pages_metadata.count_documents({})
-            alive = [process for process, _, _, _ in processes if process.poll() is None]
-            if metadata_count >= TARGET_PAGES or not alive:
-                break
-            time.sleep(0.1)
-
-        redis_client.set('crawler:shutdown', '1', ex=30)
-
-        for process, log_file, _, _ in processes:
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                process.wait(timeout=5)
-            log_file.close()
-
-        total_time = time.perf_counter() - started
-        metadata_count = db.pages_metadata.count_documents({})
-        documents_count = db.pages_documents.count_documents({})
-
-        totals = {
-            'links_extracted': 0,
-            'links_added': 0,
-            'links_duplicate': 0,
-            'recovered': 0,
-            'errors': 0,
-            'timeouts': 0,
-        }
-
-        for _, _, log_path, worker_id in processes:
-            stats = parse_worker_stats(log_path)
-            for key in totals:
-                totals[key] += stats.get(key, 0)
-            worker_rows.append({
-                'experiment_workers': workers,
-                'worker_id': worker_id,
-                'pages_crawled': stats.get('pages_crawled', 0),
-                'links_extracted': stats.get('links_extracted', 0),
-                'links_added': stats.get('links_added', 0),
-                'links_duplicate': stats.get('links_duplicate', 0),
-                'errors': stats.get('errors', 0),
-                'timeouts': stats.get('timeouts', 0),
-            })
-
-        worker_contrib = list(db.pages_metadata.aggregate([
-            {'$group': {'_id': '$worker_id', 'pages': {'$sum': 1}}},
-            {'$sort': {'_id': 1}},
-        ]))
-
-        row = {
-            'workers': workers,
-            'target_pages': TARGET_PAGES,
-            'crawled_pages': metadata_count,
-            'documents_stored': documents_count,
-            'total_time_seconds': total_time,
-            'failed_fetch_attempts': totals['errors'] + totals['timeouts'],
-            'duplicate_urls_filtered': totals['links_duplicate'],
-            'links_extracted': totals['links_extracted'],
-            'links_added': totals['links_added'],
-            'recovered_urls': totals['recovered'],
-            'frontier_size_after_run': frontier_total(redis_client),
-            'processing_size_after_run': redis_client.hlen('crawler:processing'),
-            'pages_per_second': metadata_count / total_time if total_time else 0,
-            'worker_contribution_json': json.dumps(worker_contrib, default=str),
-        }
+        row, contributions = run_crawl(
+            redis_client, db, workers, SCALING_CONCURRENCY, f'scaling-w{workers}'
+        )
         rows.append(row)
-        print(json.dumps(row, indent=2))
+        worker_rows.extend(contributions)
 
-    baseline = rows[0]['total_time_seconds']
-    for row in rows:
-        row['speedup'] = baseline / row['total_time_seconds'] if row['total_time_seconds'] else 0
-        row['parallel_efficiency'] = row['speedup'] / row['workers'] if row['workers'] else 0
-
+    add_speedup(rows, 'workers')
     write_csv(PROCESSED_DIR / 'crawl_scaling.csv', rows)
     write_csv(PROCESSED_DIR / 'worker_contribution.csv', worker_rows)
     return rows, worker_rows
+
+
+def run_concurrency_experiment(redis_client, db):
+    """One worker process, increasing in-flight fetches per worker."""
+    rows = []
+    for concurrency in CONCURRENCY_LEVELS:
+        print(f'Running concurrency experiment with 1 worker x {concurrency} fetches')
+        row, _ = run_crawl(redis_client, db, 1, concurrency, f'concurrency-c{concurrency}')
+        rows.append(row)
+
+    add_speedup(rows, 'concurrency_per_worker')
+    write_csv(PROCESSED_DIR / 'concurrency_scaling.csv', rows)
+    return rows
 
 
 def make_synthetic_document(doc_id):
@@ -759,7 +827,9 @@ def run_fault_tolerance_experiment(redis_client, db):
 
     time.sleep(1.5)
     killed_pid = processes[0][0].pid
-    processes[0][0].terminate()
+    # kill(), not terminate(): SIGTERM now triggers a graceful shutdown, and
+    # this scenario must exercise recovery from a crashed worker.
+    processes[0][0].kill()
     # Allow enough time for stale processing recovery to trigger
     time.sleep(2.0)
 
@@ -812,6 +882,7 @@ def run_fault_tolerance_experiment(redis_client, db):
     row = {
         'scenario': 'one_worker_terminated',
         'workers_started': 4,
+        'max_pages_per_worker': 20,
         'killed_worker_pid': killed_pid,
         'workers_seen_in_storage': json.dumps(worker_ids),
         'completed_pages': db.pages_metadata.count_documents({}),
@@ -855,6 +926,7 @@ def main():
 
     try:
         scaling_rows, worker_rows = run_scaling_experiment(redis_client, db)
+        concurrency_rows = run_concurrency_experiment(redis_client, db)
         index_rows = run_indexing_experiment(db)
         query_rows = run_query_latency_experiment()
         correctness = run_correctness_experiment(db)
@@ -867,11 +939,15 @@ def main():
             'api_port': API_PORT,
             'page_count': PAGE_COUNT,
             'target_pages': TARGET_PAGES,
+            'page_latency_ms': PAGE_LATENCY_SECONDS * 1000,
             'worker_counts': WORKER_COUNTS,
+            'scaling_concurrency': SCALING_CONCURRENCY,
+            'concurrency_levels': CONCURRENCY_LEVELS,
             'index_doc_counts': INDEX_DOC_COUNTS,
             'query_runs': QUERY_RUNS,
             'scaling': scaling_rows,
             'worker_contribution': worker_rows,
+            'concurrency_scaling': concurrency_rows,
             'indexing': index_rows,
             'query_latency': query_rows,
             'correctness': correctness,

@@ -279,7 +279,9 @@ def main():
 
         time.sleep(1.0)
         killed_pid = worker_processes[0][0].pid
-        worker_processes[0][0].terminate()
+        # kill(), not terminate(): SIGTERM is now a graceful shutdown and
+        # this test must exercise recovery from a crashed worker.
+        worker_processes[0][0].kill()
 
         for process, log_file in worker_processes:
             try:
