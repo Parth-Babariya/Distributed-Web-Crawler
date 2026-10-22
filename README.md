@@ -1,5 +1,7 @@
 # Distributed Web Crawler
 
+[![CI](https://github.com/Parth-Babariya/Distributed-Web-Crawler/actions/workflows/ci.yml/badge.svg)](https://github.com/Parth-Babariya/Distributed-Web-Crawler/actions/workflows/ci.yml)
+
 A Dockerized distributed web crawler with Redis coordination, MongoDB storage,
 S3-compatible HTML blob storage (SeaweedFS locally), streaming indexing, incremental PageRank, and a
 FastAPI search API.

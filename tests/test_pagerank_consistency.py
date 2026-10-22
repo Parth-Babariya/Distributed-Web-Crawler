@@ -1,7 +1,8 @@
 """Incremental PageRank must converge to the same ranks as full recompute.
 
 Needs a MongoDB replica set (transactions). Uses MONGO_URI, defaulting to the
-docker-compose port mapping; the test is skipped when MongoDB is unreachable.
+docker-compose port mapping; the test is skipped when MongoDB is unreachable
+(unless REQUIRE_MONGO is set, as in CI).
 
     docker compose up -d mongodb
     python -m unittest tests.test_pagerank_consistency
@@ -30,6 +31,10 @@ def mongo_available() -> bool:
         MongoClient(MONGO_URI, serverSelectionTimeoutMS=1500).admin.command('ping')
         return True
     except PyMongoError:
+        # CI sets REQUIRE_MONGO so a broken database fails the build
+        # instead of silently skipping these tests.
+        if os.getenv('REQUIRE_MONGO'):
+            raise
         return False
 
 

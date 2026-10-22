@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main, improvements]
+  pull_request:
+
+jobs:
+  tests:
+    name: Unit and Mongo-backed tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Check syntax
+        run: python -m compileall -q src tests scripts
+
+      # The compose mongodb service runs as replica set rs0 (transactions
+      # need one) and its healthcheck initiates the set.
+      - name: Start MongoDB replica set
+        run: docker compose up -d --wait mongodb
+
+      - name: Run tests
+        env:
+          REQUIRE_MONGO: '1'
+        run: python -m unittest -v tests.test_core_unit tests.test_pagerank_consistency tests.test_search_ranking
+
+  e2e:
+    name: Distributed end-to-end test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate compose file
+        run: docker compose config --quiet
+
+      - name: Start Redis, MongoDB and S3
+        run: docker compose up -d --wait redis mongodb s3
+
+      # Crawls a local fixture site with several workers, kills one
+      # mid-crawl, then checks recovery, index/PageRank draining and search.
+      - name: Run distributed system test
+        run: python tests/distributed_system_test.py
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
