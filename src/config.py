@@ -34,6 +34,8 @@ class CrawlerConfig:
     REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 10))
     CRAWL_DELAY = float(os.getenv('CRAWL_DELAY', 0.5))
     MAX_RETRIES = int(os.getenv('MAX_RETRIES', 3))
+    # Larger responses are skipped (permanent failure) rather than buffered.
+    MAX_PAGE_BYTES = int(os.getenv('MAX_PAGE_BYTES', 5 * 1024 * 1024))
     
     # Queue Configuration
     PROCESSING_TIMEOUT = int(os.getenv('PROCESSING_TIMEOUT', 300))

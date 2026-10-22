@@ -33,10 +33,13 @@ class CoreCrawlerTests(unittest.TestCase):
     def test_non_html_response_returns_none(self):
         class Response:
             headers = {'Content-Type': 'application/json'}
-            text = '{}'
+            url = 'http://example.com/data.json'
 
             def raise_for_status(self):
                 raise AssertionError('should not be called for non-HTML')
+
+            def close(self):
+                pass
 
         class Session:
             def get(self, *args, **kwargs):
@@ -70,6 +73,113 @@ class CoreCrawlerTests(unittest.TestCase):
 
         self.assertEqual(html, '<html><body>ok</body></html>')
         self.assertEqual(worker.last_final_url, 'http://example.com/final')
+
+    @staticmethod
+    def _requests_worker(status=200, headers=None, chunks=(b'<html>ok</html>',), max_bytes=1024):
+        class Response:
+            def __init__(self):
+                self.status_code = status
+                self.headers = {'Content-Type': 'text/html; charset=utf-8', **(headers or {})}
+                self.url = 'http://example.com/page'
+                self.encoding = 'utf-8'
+                self.closed = False
+
+            def raise_for_status(self):
+                if status >= 400:
+                    raise requests.HTTPError(f'{status}')
+
+            def iter_content(self, chunk_size):
+                yield from chunks
+
+            def close(self):
+                self.closed = True
+
+        class Session:
+            def get(self, *args, **kwargs):
+                self.response = Response()
+                return self.response
+
+        worker = DecentralizedWorker.__new__(DecentralizedWorker)
+        worker.session = Session()
+        worker.max_page_bytes = max_bytes
+        return worker
+
+    def test_http_4xx_is_permanent_but_5xx_408_429_are_transient(self):
+        for status, permanent in [(404, True), (403, True), (410, True),
+                                  (408, False), (429, False), (503, False)]:
+            worker = self._requests_worker(status=status)
+            outcome = worker._fetch_outcome('http://example.com/page', 'ua')
+            self.assertIsNone(outcome.html)
+            self.assertEqual(outcome.permanent, permanent, status)
+            self.assertTrue(worker.session.response.closed)
+
+    def test_non_html_is_permanent(self):
+        worker = self._requests_worker(headers={'Content-Type': 'application/pdf'})
+        outcome = worker._fetch_outcome('http://example.com/doc', 'ua')
+        self.assertTrue(outcome.permanent)
+
+    def test_oversized_declared_length_is_rejected_before_reading(self):
+        def never_read():
+            raise AssertionError('body should not be read')
+            yield
+
+        worker = self._requests_worker(headers={'Content-Length': '5000'}, chunks=never_read())
+        outcome = worker._fetch_outcome('http://example.com/big', 'ua')
+        self.assertEqual(outcome.error, 'too_large')
+        self.assertTrue(outcome.permanent)
+
+    def test_oversized_streamed_body_is_rejected(self):
+        worker = self._requests_worker(chunks=[b'x' * 600, b'x' * 600])
+        outcome = worker._fetch_outcome('http://example.com/big', 'ua')
+        self.assertEqual(outcome.error, 'too_large')
+
+    def test_body_within_cap_is_decoded(self):
+        worker = self._requests_worker(chunks=[b'<p>caf', b'\xc3\xa9</p>'])
+        outcome = worker._fetch_outcome('http://example.com/page', 'ua')
+        self.assertEqual(outcome.html, '<p>café</p>')
+        self.assertEqual(outcome.final_url, 'http://example.com/page')
+
+    def test_aiohttp_response_error_status_is_classified(self):
+        class ResponseError(Exception):
+            def __init__(self, status):
+                super().__init__(status)
+                self.status = status
+
+        class Fetcher:
+            def __init__(self, status):
+                self.status = status
+
+            def fetch(self, url, user_agent):
+                raise ResponseError(self.status)
+
+        worker = DecentralizedWorker.__new__(DecentralizedWorker)
+        worker.page_fetcher = Fetcher(404)
+        self.assertTrue(worker._fetch_outcome('http://example.com/x', 'ua').permanent)
+        worker.page_fetcher = Fetcher(502)
+        self.assertFalse(worker._fetch_outcome('http://example.com/x', 'ua').permanent)
+
+    def test_mark_failed_drops_permanent_and_requeues_transient(self):
+        class Ledger:
+            def release(self, url, worker_id):
+                return True
+
+        class FakeFrontier:
+            def __init__(self):
+                self.enqueued = []
+
+            def enqueue(self, url, priority, url_json):
+                self.enqueued.append(url)
+
+        worker = DecentralizedWorker.__new__(DecentralizedWorker)
+        worker.worker_id = 'unit-test'
+        worker.ledger = Ledger()
+        worker.frontier = FakeFrontier()
+        worker.max_retries = 3
+
+        worker.mark_failed({'url': 'http://example.com/gone', 'priority': 50}, permanent=True)
+        worker.mark_failed({'url': 'http://example.com/flaky', 'priority': 50})
+
+        self.assertEqual(worker.frontier.enqueued, ['http://example.com/flaky'])
 
     def test_user_agent_is_stable_per_domain(self):
         worker = DecentralizedWorker.__new__(DecentralizedWorker)

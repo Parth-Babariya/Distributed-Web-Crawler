@@ -68,6 +68,45 @@ class PageFetchResult:
     status: int = 0
 
 
+@dataclass
+class FetchOutcome:
+    """What one fetch attempt produced, as seen by the crawl pipeline.
+
+    ``permanent`` marks failures that retrying cannot fix (404, non-HTML,
+    oversized body); those URLs are dropped instead of re-queued.
+    """
+    html: Optional[str] = None
+    final_url: Optional[str] = None
+    error: Optional[str] = None
+    permanent: bool = False
+
+
+class PageTooLargeError(Exception):
+    """Response body exceeded the configured size cap."""
+
+
+# 4xx statuses that are worth retrying: the server timed out the request or
+# is rate limiting us, neither of which says anything about the URL itself.
+_RETRYABLE_4XX = {408, 429}
+
+
+def is_permanent_http_status(status: int) -> bool:
+    return 400 <= status < 500 and status not in _RETRYABLE_4XX
+
+
+def _decode_body(body: bytes, charset: Optional[str]) -> str:
+    try:
+        return body.decode(charset or 'utf-8', errors='replace')
+    except LookupError:  # unknown charset label in the Content-Type header
+        return body.decode('utf-8', errors='replace')
+
+
+def _check_declared_length(headers, max_bytes: int):
+    declared = headers.get('Content-Length', '')
+    if declared.isdigit() and int(declared) > max_bytes:
+        raise PageTooLargeError(f"Content-Length {declared} exceeds {max_bytes}")
+
+
 class AiohttpPageFetcher:
     """Persistent aiohttp fetcher with DNS cache and connection pooling.
 
@@ -79,12 +118,14 @@ class AiohttpPageFetcher:
 
     def __init__(self, dns_cache_ttl: int = 300,
                  pool_limit: int = 100,
-                 limit_per_host: int = 4):
+                 limit_per_host: int = 4,
+                 max_bytes: int = CrawlerConfig.MAX_PAGE_BYTES):
         if aiohttp is None:
             raise RuntimeError("aiohttp is not installed")
         self.dns_cache_ttl = dns_cache_ttl
         self.pool_limit = pool_limit
         self.limit_per_host = limit_per_host
+        self.max_bytes = max_bytes
         self.loop = asyncio.new_event_loop()
         self.session = None
 
@@ -128,8 +169,17 @@ class AiohttpPageFetcher:
                 )
 
             response.raise_for_status()
+            # Read at most max_bytes so one huge page cannot exhaust worker
+            # memory or produce a document over MongoDB's 16MB limit.
+            _check_declared_length(response.headers, self.max_bytes)
+            body = bytearray()
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                body.extend(chunk)
+                if len(body) > self.max_bytes:
+                    raise PageTooLargeError(f"Body exceeds {self.max_bytes} bytes")
+
             return PageFetchResult(
-                html=await response.text(errors='replace'),
+                html=_decode_body(bytes(body), response.charset),
                 final_url=final_url,
                 content_type=content_type,
                 status=response.status,
@@ -172,7 +222,9 @@ class DecentralizedWorker:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
         'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0'
     ]
-    
+
+    max_page_bytes = CrawlerConfig.MAX_PAGE_BYTES
+
     def __init__(self, worker_id: str = None,
                  redis_host: str = None, redis_port: int = None,
                  mongodb_uri: str = None,
@@ -301,6 +353,7 @@ class DecentralizedWorker:
             dns_cache_ttl=dns_ttl,
             pool_limit=pool_limit,
             limit_per_host=limit_per_host,
+            max_bytes=self.max_page_bytes,
         )
     
     def _create_session(self) -> requests.Session:
@@ -522,8 +575,11 @@ class DecentralizedWorker:
             )
         return owned
 
-    def mark_failed(self, url_data: Dict):
+    def mark_failed(self, url_data: Dict, permanent: bool = False):
         """Retry failed URLs a few times, then drop them from processing.
+
+        Permanent failures (404, non-HTML, oversized) are dropped right away;
+        retrying them only spends politeness budget on a known outcome.
 
         If we no longer own the lease (a recovery worker took the URL),
         skip both the release and the re-enqueue — the new owner is now
@@ -537,6 +593,10 @@ class DecentralizedWorker:
                 f"[{self.worker_id}] Zombie failure on {url} — "
                 f"another worker took over; not re-queuing"
             )
+            return
+
+        if permanent:
+            logger.debug(f"[{self.worker_id}] Dropping permanently failed URL: {url}")
             return
 
         retries = int(url_data.get('retries', 0)) + 1
@@ -587,67 +647,112 @@ class DecentralizedWorker:
     def fetch_page(self, url: str) -> Optional[str]:
         """
         Fetch page with aggressive timeout and User-Agent rotation.
-        
+
         Args:
             url: URL to fetch
-            
+
         Returns:
             HTML content or None on error
         """
+        outcome = self._fetch_outcome(url, self._user_agent_for_url(url))
+        self._record_fetch_outcome(url, outcome)
+        if outcome.html is not None:
+            self.last_final_url = self.normalize_url(outcome.final_url or url)
+        return outcome.html
+
+    def _fetch_outcome(self, url: str, user_agent: str) -> FetchOutcome:
+        """Fetch ``url`` and classify the result. Never raises.
+
+        Touches no worker state, so it is safe to run on fetch threads.
+        """
         page_fetcher = getattr(self, 'page_fetcher', None)
-        user_agent = self._user_agent_for_url(url)
-        if page_fetcher is not None:
-            try:
-                result = page_fetcher.fetch(url, user_agent)
-                if result.html is None:
-                    logger.debug(
-                        f"[{self.worker_id}] Skipping non-HTML: {url} "
-                        f"({result.status} {result.content_type})"
-                    )
-                    return None
+        if page_fetcher is None:
+            return self._fetch_outcome_requests(url, user_agent)
 
-                self.last_final_url = self.normalize_url(result.final_url)
-                return result.html
+        try:
+            result = page_fetcher.fetch(url, user_agent)
+        except (asyncio.TimeoutError, TimeoutError):
+            return FetchOutcome(error='timeout')
+        except PageTooLargeError:
+            return FetchOutcome(error='too_large', permanent=True)
+        except Exception as e:
+            # aiohttp.ClientResponseError carries the HTTP status.
+            status = getattr(e, 'status', None)
+            if isinstance(status, int) and status >= 400:
+                return FetchOutcome(
+                    error=f'http_{status}',
+                    permanent=is_permanent_http_status(status),
+                )
+            return FetchOutcome(error=f'error: {e}')
 
-            except (asyncio.TimeoutError, TimeoutError):
-                self.stats['timeouts'] += 1
-                logger.debug(f"[{self.worker_id}] Timeout: {url}")
-                return None
-            except Exception as e:
-                self.stats['errors'] += 1
-                logger.debug(f"[{self.worker_id}] Error fetching {url}: {e}")
-                return None
+        if result.html is None:
+            return FetchOutcome(
+                final_url=result.final_url,
+                error=f'not_html ({result.status} {result.content_type})',
+                permanent=True,
+            )
+        return FetchOutcome(html=result.html, final_url=result.final_url)
 
-        return self._fetch_page_requests(url)
-
-    def _fetch_page_requests(self, url: str) -> Optional[str]:
+    def _fetch_outcome_requests(self, url: str, user_agent: str) -> FetchOutcome:
         """Synchronous requests fallback used when aiohttp is unavailable."""
         try:
             response = self.session.get(
                 url,
                 timeout=(3.05, 10),  # (connect, read) timeout
-                headers={'User-Agent': self._user_agent_for_url(url)},
-                allow_redirects=True
+                headers={'User-Agent': user_agent},
+                allow_redirects=True,
+                stream=True,  # read the body incrementally under the size cap
             )
-            
-            # Check content type
+        except requests.Timeout:
+            return FetchOutcome(error='timeout')
+        except Exception as e:
+            return FetchOutcome(error=f'error: {e}')
+
+        try:
             content_type = response.headers.get('Content-Type', '')
             if 'text/html' not in content_type.lower():
-                logger.debug(f"[{self.worker_id}] Skipping non-HTML: {url}")
-                return None
-            
+                return FetchOutcome(
+                    final_url=response.url,
+                    error=f'not_html ({content_type})',
+                    permanent=True,
+                )
+
             response.raise_for_status()
-            self.last_final_url = self.normalize_url(response.url)
-            return response.text
-            
+            _check_declared_length(response.headers, self.max_page_bytes)
+            body = bytearray()
+            for chunk in response.iter_content(64 * 1024):
+                body.extend(chunk)
+                if len(body) > self.max_page_bytes:
+                    raise PageTooLargeError(f"Body exceeds {self.max_page_bytes} bytes")
+            return FetchOutcome(
+                html=_decode_body(bytes(body), response.encoding),
+                final_url=response.url,
+            )
+        except PageTooLargeError:
+            return FetchOutcome(error='too_large', permanent=True)
+        except requests.HTTPError:
+            status = response.status_code
+            return FetchOutcome(
+                error=f'http_{status}',
+                permanent=is_permanent_http_status(status),
+            )
         except requests.Timeout:
-            self.stats['timeouts'] += 1
-            logger.debug(f"[{self.worker_id}] Timeout: {url}")
-            return None
+            return FetchOutcome(error='timeout')
         except Exception as e:
+            return FetchOutcome(error=f'error: {e}')
+        finally:
+            response.close()
+
+    def _record_fetch_outcome(self, url: str, outcome: FetchOutcome):
+        """Update stats/logs for a fetch. Runs on the main thread only."""
+        if outcome.error is None:
+            return
+        if outcome.error == 'timeout':
+            self.stats['timeouts'] += 1
+        elif not outcome.error.startswith('not_html'):
             self.stats['errors'] += 1
-            logger.debug(f"[{self.worker_id}] Error fetching {url}: {e}")
-            return None
+        kind = 'permanent' if outcome.permanent else 'transient'
+        logger.debug(f"[{self.worker_id}] Fetch failed ({kind}, {outcome.error}): {url}")
     
     def parse_and_extract_links(self, html: str, base_url: str) -> List[str]:
         """
@@ -777,33 +882,49 @@ class DecentralizedWorker:
             self.frontier.enqueue(link, priority, json.dumps(url_data))
             self.stats['links_added'] += 1
     
-    def crawl_page(self, url_data: Dict) -> bool:
+    def _complete_crawl(self, url_data: Dict, outcome: FetchOutcome):
+        """Finish one fetched URL: store or fail it, then free its domain.
+
+        The politeness lock currently covers (crawl_delay +
+        max_request_timeout); shrink it back to crawl_delay first so the
+        cooldown clock starts from connection-close, not connection-open.
         """
-        Complete crawl pipeline for one URL.
-        
+        domain = url_data.get('domain') or frontier_extract_domain(url_data['url'])
+        self.politeness.release_after_crawl_domain(domain, url_data.get('crawl_delay'))
+
+        # On success the URL is now queued in the storage batch — the lease
+        # is NOT released yet. The release happens in _process_flush_result,
+        # after Mongo has durably written the page. On failure (network
+        # error, zombie, non-HTML), release/re-enqueue immediately.
+        if not self._finish_crawl(url_data, outcome):
+            self.mark_failed(url_data, permanent=outcome.permanent)
+
+        # Drain any committed/duplicate/failed work from a flush that may
+        # have happened above (or trigger a flush when the batch fills up).
+        self._maybe_flush()
+
+        # Return the domain to the tail of active_domains so other workers
+        # (or this one) can pick it up for its next URL. push_back is a
+        # no-op if the per-domain frontier became empty.
+        self.frontier.push_back(domain)
+
+    def _finish_crawl(self, url_data: Dict, outcome: FetchOutcome) -> bool:
+        """
+        Post-fetch crawl pipeline for one URL: parse, enqueue links, batch.
+
         Args:
             url_data: URL data dictionary
-            
+            outcome: result of fetching url_data['url']
+
         Returns:
             True if successful, False otherwise
         """
         url = url_data['url']
         depth = url_data.get('depth', 0)
-        crawl_delay = url_data.get('crawl_delay')
-        domain = url_data.get('domain') or frontier_extract_domain(url)
 
         try:
-            logger.info(f"[{self.worker_id}] Crawling: {url}")
-
-            # 1. Fetch page. The politeness lock currently covers
-            #    (crawl_delay + max_request_timeout); shrink it back to
-            #    crawl_delay the moment the fetch returns so the cooldown
-            #    clock starts from connection-close, not connection-open.
-            try:
-                html = self.fetch_page(url)
-            finally:
-                self.politeness.release_after_crawl_domain(domain, crawl_delay)
-
+            self._record_fetch_outcome(url, outcome)
+            html = outcome.html
             if not html:
                 return False
 
@@ -819,7 +940,7 @@ class DecentralizedWorker:
                 )
                 return False
 
-            page_url = getattr(self, 'last_final_url', url)
+            page_url = self.normalize_url(outcome.final_url or url)
             self.bloom_filter.add(page_url)
             
             # 2. Parse and extract links
@@ -996,28 +1117,11 @@ class DecentralizedWorker:
                 # Reset idle timer
                 idle_since = None
 
-                domain = url_data.get('domain') or frontier_extract_domain(url_data['url'])
+                url = url_data['url']
+                logger.info(f"[{self.worker_id}] Crawling: {url}")
+                outcome = self._fetch_outcome(url, self._user_agent_for_url(url))
+                self._complete_crawl(url_data, outcome)
 
-                # Crawl page. On success, the URL is now queued in the
-                # storage batch — the lease is NOT released yet. The
-                # release happens in _process_flush_result, after Mongo
-                # has durably written the page. On failure (network error,
-                # zombie, non-HTML), release/re-enqueue immediately.
-                success = self.crawl_page(url_data)
-                if not success:
-                    self.mark_failed(url_data)
-
-                # Drain any committed/duplicate/failed work from a flush
-                # that may have happened above (or trigger a flush when
-                # the batch fills up).
-                self._maybe_flush()
-
-                # Return the domain to the tail of active_domains so other
-                # workers (or this one on the next iteration) can pick it up
-                # for its next URL. push_back is a no-op if the per-domain
-                # frontier became empty.
-                self.frontier.push_back(domain)
-                
         except KeyboardInterrupt:
             logger.info(f"[{self.worker_id}] Interrupted by user")
         finally:
