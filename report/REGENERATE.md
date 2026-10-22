@@ -2,7 +2,7 @@
 
 The report ([report/main.tex](main.tex)) is designed to compile cleanly even when no figures have been generated yet — missing figures show a labelled placeholder via the `\rendered` macro. This file documents the exact sequence to produce the actual data, render the diagrams, and compile the PDF.
 
-The report architecture changed substantially (two-tier frontier, transactional outbox, streaming indexer, incremental PageRank, MinIO blob storage, atomic Lua coordination paths). All previous CSVs/JSONs and PDF figures have been removed so the report cannot accidentally show stale numbers from the old architecture.
+The report architecture changed substantially (two-tier frontier, transactional outbox, streaming indexer, incremental PageRank, S3 blob storage, atomic Lua coordination paths). All previous CSVs/JSONs and PDF figures have been removed so the report cannot accidentally show stale numbers from the old architecture.
 
 ---
 
@@ -21,7 +21,7 @@ If you don't have `mmdc` installed, the report still compiles — diagrams just 
 
 ```bash
 docker compose down -v --remove-orphans
-docker compose up -d --build redis mongodb minio streaming-indexer pagerank-worker search-api
+docker compose up -d --build redis mongodb s3 streaming-indexer pagerank-worker search-api
 ```
 
 Wait for the MongoDB replica set to elect a primary:
@@ -38,7 +38,7 @@ You want at least one member showing `PRIMARY`.
 ## Step 2 — Run Tests First (Confirms the Build Is Healthy)
 
 ```bash
-python -m unittest tests.test_core_unit
+python -m unittest tests.test_core_unit tests.test_pagerank_consistency tests.test_search_ranking
 ```
 
 Expect all tests to pass.
@@ -61,6 +61,10 @@ This produces:
 
 These produce the CSV/JSON files in `results/processed/` that drive the report's tables and graphs.
 
+Stop the compose `streaming-indexer`, `pagerank-worker` and `search-api` containers first (`docker compose stop streaming-indexer pagerank-worker search-api`): the scripts run their own consumers and API, and the containers would compete for the same outbox events and skew the timings.
+
+Crawl throughput is measured in steady state (pages between the 10th and 90th percentile of `crawled_at` timestamps) against a fixture with 100 ms per page; set `EVAL_PAGE_LATENCY_MS` to change it.
+
 ```bash
 # Full empirical suite (worker scaling, indexing, query latency, fault tolerance, etc.)
 python scripts/run_evaluation_experiments.py
@@ -74,16 +78,16 @@ python scripts/run_report_supplement_metrics.py
 
 Each script is idempotent: it cleans the relevant Redis/Mongo collections before running, so you can re-run without manual cleanup.
 
-**Note:** the evaluation scripts may need updating to exercise the new architecture (`term_postings` instead of `inverted_index`, `streaming_indexer` instead of batch `mapreduce_indexer`, `pagerank_worker` invocation). See `scripts/` for the current state — if a script throws an error on a missing collection, that's the migration signal.
-
 Expected output files in `results/processed/`:
 
 | File | Source script | What it contains |
 |---|---|---|
-| `crawl_scaling.csv` | `run_evaluation_experiments.py` | (workers, pages, time_s, pages_per_s, speedup, efficiency) |
+| `crawl_scaling.csv` | `run_evaluation_experiments.py` | 1-20 workers, one in-flight fetch each: pages, wall time, steady pages/s, speedup, efficiency |
+| `concurrency_scaling.csv` | `run_evaluation_experiments.py` | one worker with 1-16 in-flight fetches |
 | `worker_contribution.csv` | `run_evaluation_experiments.py` | per-worker fetched/stored counts |
 | `streaming_indexer_lag.csv` | `run_report_supplement_metrics.py` | `index_outbox` pending count over time |
 | `pagerank_convergence.csv` | `run_report_supplement_metrics.py` | full-recompute L1 delta vs iteration |
+| `pagerank_incremental_vs_recompute.json` | `run_report_supplement_metrics.py` | gap between incremental and recomputed ranks on the crawl graph |
 | `query_latency.csv` | `run_evaluation_experiments.py` | latency by query type |
 | `redis_latency.csv` | `run_report_supplement_metrics.py` | per-op latency for Lua scripts and primitives |
 | `mongodb_latency.csv` | `run_report_supplement_metrics.py` | transaction commit, outbox claim, postings upsert latency |
@@ -109,6 +113,8 @@ Expected files in `report/figures/`:
 
 ```
 throughput_vs_workers.pdf, throughput_vs_workers.png
+throughput_vs_concurrency.pdf, throughput_vs_concurrency.png
+speedup_vs_concurrency.pdf, speedup_vs_concurrency.png
 speedup_vs_workers.pdf, speedup_vs_workers.png
 parallel_efficiency_vs_workers.pdf, parallel_efficiency_vs_workers.png
 crawl_time_vs_workers.pdf, crawl_time_vs_workers.png
@@ -193,7 +199,7 @@ After regeneration, the report should:
 
 **MongoDB transactions fail:** confirm `rs.status().ok` returns 1 and at least one `PRIMARY` member. The single-node replica set sometimes takes 10-30s to elect on first boot.
 
-**MinIO blob writes fail:** `docker compose ps minio` should show `healthy`. The crawler's `S3HtmlBlobStore` will auto-create the `crawler-html` bucket on first use.
+**S3 blob writes fail:** `docker compose ps s3` should show `healthy`. The crawler's `S3HtmlBlobStore` will auto-create the `crawler-html` bucket on first use.
 
 **Streaming indexer / PageRank worker have no events:** check `docker compose logs --tail=100 streaming-indexer pagerank-worker`. If the crawler hasn't run yet, the outboxes are empty — that's expected.
 
