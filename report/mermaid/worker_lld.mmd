@@ -15,7 +15,7 @@ flowchart TB
     Verify{"still own<br/>URL lease?"}:::redis
     Parse["parse HTML<br/>extract clean text + links"]:::work
     Dedupe["filter links<br/>robots batch + Bloom Lua"]:::redis
-    Blob["write compressed HTML<br/>to MinIO/S3"]:::io
+    Blob["write compressed HTML<br/>to S3 (SeaweedFS)"]:::io
     Txn["Mongo transaction<br/>metadata, content pointer, document,<br/>index_outbox, graph_outbox"]:::txn
     Result{"flush result"}:::txn
     Done["release committed lease<br/>update worker stats"]:::redis

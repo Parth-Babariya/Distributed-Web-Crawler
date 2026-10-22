@@ -22,6 +22,68 @@ drain, no manual PageRank drain, and no manual crawler stop.
 Important: `tests/distributed_system_test.py` cleans Redis/MongoDB test state.
 Run it after the automatic Docker run, or run the Docker flow again afterward.
 
+## Architecture
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial","primaryTextColor":"#102a43","lineColor":"#486581"},"flowchart":{"nodeSpacing":36,"rankSpacing":58,"curve":"basis"}}}%%
+flowchart LR
+    classDef input fill:#E3F2FD,stroke:#1976D2,color:#0D47A1
+    classDef redis fill:#FFF8E1,stroke:#F9A825,color:#4E342E
+    classDef worker fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    classDef storage fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C
+    classDef stream fill:#E0F7FA,stroke:#00838F,color:#004D40
+    classDef query fill:#FCE4EC,stroke:#C2185B,color:#880E4F
+
+    Seed["Seed URLs<br/>seed_urls.txt"]:::input
+    Web(("Web sites<br/>HTML + robots.txt")):::input
+
+    subgraph R["Redis coordination"]
+        Frontier["Two-tier frontier<br/>active_domains +<br/>frontier:&lt;domain&gt;"]:::redis
+        Bloom["Bloom dedupe<br/>Lua check-and-set"]:::redis
+        Lease["Processing ledger<br/>URL TTL leases"]:::redis
+        Polite["Robots + politeness<br/>one lock per domain"]:::redis
+    end
+
+    Workers["crawler-worker x N<br/>8 fetches in flight<br/>(1 per domain)<br/>5MB cap, drops 4xx"]:::worker
+
+    subgraph S["Durable storage"]
+        Blob[("S3 store (SeaweedFS)<br/>compressed HTML blobs")]:::storage
+        Txn["MongoDB transaction<br/>metadata + blob pointer + clean text"]:::storage
+        Outbox["Transactional outboxes<br/>index_outbox + graph_outbox"]:::storage
+    end
+
+    subgraph C["Streaming consumers"]
+        Indexer["streaming-indexer x M<br/>term diff -> term_postings<br/>tf, doc_length, in_title"]:::stream
+        PageRank["pagerank-worker x K<br/>edge deltas + residual push<br/>local updates, no O(N) step"]:::stream
+    end
+
+    subgraph Q["Serving path"]
+        Search["FastAPI search-api<br/>BM25 x damped PageRank"]:::query
+        User["User / evaluator"]:::query
+    end
+
+    Seed --> Frontier
+    Frontier --> Workers
+    Bloom <--> Workers
+    Lease <--> Workers
+    Polite <--> Workers
+    Workers <-->|HTTP| Web
+
+    Workers --> Blob
+    Workers --> Txn
+    Txn --> Outbox
+
+    Outbox --> Indexer
+    Outbox --> PageRank
+    Indexer -->|term_postings| Search
+    PageRank -->|pagerank_nodes| Search
+    Txn -->|snippets| Search
+    Search --> User
+```
+
+Source: `report/mermaid/architecture.mmd` (rendered to `report/figures/architecture.pdf`
+for the report and slides, see `report/REGENERATE.md`).
+
 ## Components
 
 | Service | Role |

@@ -26,7 +26,7 @@ flowchart TB
         Graph["authority state<br/>graph_edges,<br/>pagerank_nodes"]:::mongo
     end
 
-    Blob[("MinIO / S3<br/>HTML blobs")]:::mongo
+    Blob[("S3 store (SeaweedFS)<br/>HTML blobs")]:::mongo
 
     Seed --> F
     F --> Worker
