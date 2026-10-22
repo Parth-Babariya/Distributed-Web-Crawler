@@ -5,6 +5,26 @@ The crawler writes graph_outbox events transactionally with page data. This
 worker consumes those durable events, updates the historical graph_edges
 ledger, and propagates PageRank deltas through pagerank_nodes using residual
 pushes. Query-time search only reads the precomputed rank values.
+
+Scale and formulation
+---------------------
+Ranks use the *unnormalized* PageRank equation
+
+    x = (1 - d) * t + d * A^T x + d * D(x)
+
+where ``t`` is the teleport vector (1 for every node, or 1 for seed URLs
+only when ``--seed-url`` is given), ``A`` is the row-normalized link matrix
+and ``D(x)`` routes the rank of dangling nodes to the seed URLs (or drops it
+when no seeds are configured). Ranks therefore sit on a fixed scale (a page
+with no in-links has rank ``1 - d``) instead of summing to 1.
+
+This choice keeps every update *local*: adding a node only seeds that node's
+own residual with ``(1 - d) * t[node]``, and no update ever has to touch all
+nodes. A normalized/uniform teleport would change every node's teleport mass
+whenever the graph grows, which forces an O(N) write per new node.
+
+``full_recompute`` solves the same equation by power iteration, so the
+incremental and batch paths converge to the same fixed point.
 """
 
 import argparse
@@ -15,7 +35,7 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pymongo import MongoClient, ReturnDocument, UpdateOne
 from pymongo.errors import PyMongoError
@@ -37,7 +57,6 @@ class IncrementalPageRankWorker:
         damping: float = 0.85,
         epsilon: float = 1e-6,
         claim_timeout_seconds: int = 300,
-        default_rank: float = 1.0,
         seed_urls: Optional[Sequence[str]] = None,
     ):
         self.client = MongoClient(mongodb_uri or CrawlerConfig.get_mongo_url())
@@ -47,12 +66,12 @@ class IncrementalPageRankWorker:
         self.nodes = self.db['pagerank_nodes']
         self.worker_id = worker_id or f"pagerank-{uuid.uuid4().hex[:8]}"
         self.damping = damping
+        # Residuals with |r| <= epsilon are not pushed. Ranks are O(1) on the
+        # unnormalized scale, so an absolute threshold is meaningful.
         self.epsilon = epsilon
         self.claim_timeout = timedelta(seconds=claim_timeout_seconds)
-        self.default_rank = default_rank
-        self.seed_urls = [url for url in (seed_urls or []) if url]
-        self.min_residual = 1e-12
-        self.rank_floor = 1e-12
+        self.seed_urls = self._unique_urls(seed_urls or [])
+        self._seed_set = set(self.seed_urls)
         self._create_indexes()
 
     def _create_indexes(self):
@@ -137,57 +156,65 @@ class IncrementalPageRankWorker:
                 return True
         return False
 
-    def _personalization_vector(self, extra_urls: Set[str], session=None) -> Dict[str, float]:
-        if self.seed_urls:
-            targets = set(self.seed_urls)
-        else:
-            targets = set(self.nodes.distinct('url', session=session))
-            targets.update(extra_urls)
+    def teleport_mass(self, url: str) -> float:
+        """Residual a node starts with: (1 - d) * t[url]."""
+        if self._seed_set and url not in self._seed_set:
+            return 0.0
+        return 1.0 - self.damping
 
-        targets = {url for url in targets if url}
-        if not targets:
-            targets = set(extra_urls) or {'__pagerank_root__'}
+    def dangling_targets(self) -> Dict[str, float]:
+        """Where a dangling node's rank flows: seeds, or nowhere (dropped)."""
+        if not self.seed_urls:
+            return {}
+        weight = 1.0 / len(self.seed_urls)
+        return {url: weight for url in self.seed_urls}
 
-        weight = 1.0 / len(targets)
-        return {url: weight for url in targets}
+    def _outflow(self, rank: float, links: List[str]) -> Dict[str, float]:
+        """Rank mass a node with ``rank`` sends to each target."""
+        if links:
+            share = self.damping * rank / len(links)
+            return {url: share for url in links}
+        return {
+            url: self.damping * rank * weight
+            for url, weight in self.dangling_targets().items()
+        }
 
     def _ensure_node(self, url: str, session=None):
-        now = datetime.utcnow()
-        self.nodes.update_one(
-            {'url': url},
-            {
-                '$setOnInsert': {
-                    'rank': self.default_rank,
-                    'residual': 0.0,
-                    'created_at': now,
-                },
-                '$set': {'last_updated': now},
-            },
-            upsert=True,
-            session=session,
-        )
+        self._add_residual_delta(url, 0.0, session=session)
 
     def _get_rank(self, url: str, session=None) -> float:
         node = self.nodes.find_one({'url': url}, {'rank': 1}, session=session)
         if node is None:
             self._ensure_node(url, session=session)
-            return self.default_rank
-        return float(node.get('rank', self.default_rank))
+            return 0.0
+        return float(node.get('rank', 0.0))
 
     def _add_residual_delta(self, url: str, delta: float, session=None):
-        if not url or abs(delta) < self.min_residual:
+        """Add ``delta`` to url's residual, creating the node if needed.
+
+        A new node starts at rank 0 with its teleport mass as residual — the
+        initial state of forward-push PageRank. The pipeline update lets one
+        upsert both initialize and increment, which $setOnInsert + $inc on
+        the same field cannot.
+        """
+        if not url:
             return
         now = datetime.utcnow()
         self.nodes.update_one(
             {'url': url},
-            {
-                '$setOnInsert': {
-                    'rank': self.default_rank,
-                    'created_at': now,
-                },
-                '$inc': {'residual': delta},
-                '$set': {'last_updated': now},
-            },
+            [{
+                '$set': {
+                    'rank': {'$ifNull': ['$rank', 0.0]},
+                    'residual': {
+                        '$add': [
+                            {'$ifNull': ['$residual', self.teleport_mass(url)]},
+                            float(delta),
+                        ]
+                    },
+                    'created_at': {'$ifNull': ['$created_at', now]},
+                    'last_updated': now,
+                }
+            }],
             upsert=True,
             session=session,
         )
@@ -197,29 +224,17 @@ class IncrementalPageRankWorker:
         source_rank: float,
         old_links: List[str],
         new_links: List[str],
-        source_url: str,
-        session=None,
     ) -> Dict[str, float]:
+        """Residual corrections when a source's out-links change.
+
+        The source has already pushed ``source_rank`` through its old links;
+        withdraw that mass from the old targets and send it to the new ones.
+        """
         deltas = defaultdict(float)
-        extra_urls = set(old_links) | set(new_links) | {source_url}
-        personalization = self._personalization_vector(extra_urls, session=session)
-
-        if old_links:
-            old_contrib = self.damping * source_rank / len(old_links)
-            for url in old_links:
-                deltas[url] -= old_contrib
-        else:
-            for url, weight in personalization.items():
-                deltas[url] -= self.damping * source_rank * weight
-
-        if new_links:
-            new_contrib = self.damping * source_rank / len(new_links)
-            for url in new_links:
-                deltas[url] += new_contrib
-        else:
-            for url, weight in personalization.items():
-                deltas[url] += self.damping * source_rank * weight
-
+        for url, mass in self._outflow(source_rank, old_links).items():
+            deltas[url] -= mass
+        for url, mass in self._outflow(source_rank, new_links).items():
+            deltas[url] += mass
         return dict(deltas)
 
     def _process_event_once(self, event: Dict) -> bool:
@@ -263,14 +278,14 @@ class IncrementalPageRankWorker:
 
                 old_links = self._unique_urls(edge_doc.get('outbound_urls', [])) if edge_doc else []
                 source_rank = self._get_rank(source_url, session=session)
-                deltas = self._contribution_deltas(
-                    source_rank,
-                    old_links,
-                    new_links,
-                    source_url,
-                    session=session,
-                )
+                deltas = self._contribution_deltas(source_rank, old_links, new_links)
 
+                # Every new link target becomes a graph node (even when the
+                # source has no rank to give yet), and the source node is
+                # written so a concurrent residual push on it conflicts with
+                # this transaction instead of reading the old out-links.
+                for url in [source_url, *new_links]:
+                    deltas.setdefault(url, 0.0)
                 for target_url, delta in deltas.items():
                     self._add_residual_delta(target_url, delta, session=session)
 
@@ -329,8 +344,8 @@ class IncrementalPageRankWorker:
             {
                 'residual_claimed_at': {'$exists': False},
                 '$or': [
-                    {'residual': {'$gt': self.min_residual}},
-                    {'residual': {'$lt': -self.min_residual}},
+                    {'residual': {'$gt': self.epsilon}},
+                    {'residual': {'$lt': -self.epsilon}},
                 ],
             },
             {
@@ -358,10 +373,8 @@ class IncrementalPageRankWorker:
                     if current is None:
                         return False
 
-                    rank = float(current.get('rank', self.default_rank))
                     residual = float(current.get('residual', 0.0))
-                    threshold = self.epsilon * max(abs(rank), self.rank_floor)
-                    if abs(residual) <= threshold:
+                    if abs(residual) <= self.epsilon:
                         self.nodes.update_one(
                             {'url': url},
                             {'$unset': {'residual_claimed_at': '', 'residual_worker_id': ''}},
@@ -371,8 +384,6 @@ class IncrementalPageRankWorker:
 
                     edge_doc = self.edges.find_one({'source_url': url}, session=session)
                     successors = self._unique_urls(edge_doc.get('outbound_urls', [])) if edge_doc else []
-                    extra_urls = set(successors) | {url}
-                    personalization = self._personalization_vector(extra_urls, session=session)
 
                     self.nodes.update_one(
                         {'url': url},
@@ -390,17 +401,8 @@ class IncrementalPageRankWorker:
                         session=session,
                     )
 
-                    if successors:
-                        pushed_delta = self.damping * residual / len(successors)
-                        for successor in successors:
-                            self._add_residual_delta(successor, pushed_delta, session=session)
-                    else:
-                        for target_url, weight in personalization.items():
-                            self._add_residual_delta(
-                                target_url,
-                                self.damping * residual * weight,
-                                session=session,
-                            )
+                    for target_url, mass in self._outflow(residual, successors).items():
+                        self._add_residual_delta(target_url, mass, session=session)
             return True
         except Exception as exc:
             logger.exception("Failed to push residual for %s: %s", url, exc)
@@ -441,6 +443,32 @@ class IncrementalPageRankWorker:
             if not events and not pushes:
                 time.sleep(sleep_seconds)
 
+    def power_iteration(self, nodes: Set[str], outgoing: Dict[str, List[str]],
+                        convergence_epsilon: float = 1e-8,
+                        max_iterations: int = 100) -> Tuple[Dict[str, float], int, float]:
+        """Solve the module-level PageRank equation by power iteration.
+
+        Pure function of the graph (no database access), so it doubles as the
+        reference the incremental residual-push path is tested against.
+        Returns (ranks, iterations_run, final_l1_delta).
+        """
+        teleport = {url: self.teleport_mass(url) for url in nodes}
+        ranks = dict(teleport)
+        l1_delta = 0.0
+        iteration = 0
+
+        for iteration in range(1, max_iterations + 1):
+            new_ranks = dict(teleport)
+            for source in nodes:
+                for target, mass in self._outflow(ranks[source], outgoing.get(source, [])).items():
+                    new_ranks[target] = new_ranks.get(target, 0.0) + mass
+            l1_delta = sum(abs(new_ranks[url] - ranks.get(url, 0.0)) for url in new_ranks)
+            ranks = new_ranks
+            if l1_delta < convergence_epsilon:
+                break
+
+        return ranks, iteration, l1_delta
+
     def full_recompute(self, convergence_epsilon: float = 1e-8,
                        max_iterations: int = 100) -> Dict:
         """Run converged power iteration from graph_edges and reset residuals."""
@@ -455,51 +483,15 @@ class IncrementalPageRankWorker:
             nodes.update(links)
             outgoing[source] = links
 
-        nodes.update(self.nodes.distinct('url'))
+        # Iterate instead of distinct(): distinct's result is capped at 16MB.
+        nodes.update(doc['url'] for doc in self.nodes.find({}, {'url': 1}))
+        nodes.update(self.seed_urls)
         if not nodes:
             return {'nodes': 0, 'iterations': 0, 'l1_delta': 0.0}
 
-        personalization = self._personalization_vector(nodes)
-        for url in nodes:
-            personalization.setdefault(url, 0.0)
-
-        # If seed personalization omits some graph nodes, the non-seed nodes
-        # still participate in link flow; their teleport probability is zero.
-        total_p = sum(personalization.values())
-        if total_p <= 0:
-            weight = 1.0 / len(nodes)
-            personalization = {url: weight for url in nodes}
-        elif abs(total_p - 1.0) > 1e-12:
-            personalization = {url: weight / total_p for url, weight in personalization.items()}
-
-        initial = 1.0 / len(nodes)
-        ranks = {url: initial for url in nodes}
-        l1_delta = 0.0
-        iteration = 0
-
-        for iteration in range(1, max_iterations + 1):
-            new_ranks = {
-                url: (1.0 - self.damping) * personalization.get(url, 0.0)
-                for url in nodes
-            }
-            dangling_mass = sum(
-                rank for url, rank in ranks.items() if not outgoing.get(url)
-            )
-            for url, weight in personalization.items():
-                if url in new_ranks:
-                    new_ranks[url] += self.damping * dangling_mass * weight
-
-            for source, links in outgoing.items():
-                if not links:
-                    continue
-                contribution = self.damping * ranks.get(source, 0.0) / len(links)
-                for target in links:
-                    new_ranks[target] = new_ranks.get(target, 0.0) + contribution
-
-            l1_delta = sum(abs(new_ranks.get(url, 0.0) - ranks.get(url, 0.0)) for url in nodes)
-            ranks = new_ranks
-            if l1_delta < convergence_epsilon:
-                break
+        ranks, iteration, l1_delta = self.power_iteration(
+            nodes, outgoing, convergence_epsilon, max_iterations
+        )
 
         now = datetime.utcnow()
         operations = [
@@ -539,7 +531,7 @@ def parse_args():
     parser.add_argument('--database', default=None, help='MongoDB database name')
     parser.add_argument('--worker-id', default=None, help='Stable worker ID')
     parser.add_argument('--damping', type=float, default=0.85, help='PageRank damping factor')
-    parser.add_argument('--epsilon', type=float, default=1e-6, help='Residual push threshold multiplier')
+    parser.add_argument('--epsilon', type=float, default=1e-6, help='Absolute residual threshold below which nodes are not pushed')
     parser.add_argument('--claim-timeout', type=int, default=300, help='Seconds before processing claims are reclaimed')
     parser.add_argument('--sleep', type=float, default=1.0, help='Idle sleep seconds')
     parser.add_argument('--max-events', type=int, default=10, help='Events processed per loop')
