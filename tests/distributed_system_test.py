@@ -42,9 +42,9 @@ def process_env():
     env.setdefault('RECOVERY_INTERVAL', '1')
     env.setdefault('CRAWLER_CONTENT_STORE', 's3')
     env.setdefault('S3_BUCKET', 'crawler-html')
-    env.setdefault('S3_ENDPOINT_URL', 'http://localhost:9000')
-    env.setdefault('AWS_ACCESS_KEY_ID', 'minioadmin')
-    env.setdefault('AWS_SECRET_ACCESS_KEY', 'minioadmin')
+    env.setdefault('S3_ENDPOINT_URL', 'http://localhost:8333')
+    env.setdefault('AWS_ACCESS_KEY_ID', 'crawler')
+    env.setdefault('AWS_SECRET_ACCESS_KEY', 'crawler-secret')
     env.setdefault('AWS_REGION', 'us-east-1')
     return env
 

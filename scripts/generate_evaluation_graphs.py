@@ -653,7 +653,7 @@ pdflatex -interaction=nonstopmode -output-directory report report/main.tex
 
 ## Limitations
 
-The crawl experiments use a deterministic local website spread across multiple ports to simulate multiple domains. Workers still use the real Redis frontier, processing ledger, MongoDB transactions, MinIO blob store, streaming indexer, PageRank worker, and search aggregation path. The local fixture makes the results reproducible, but it does not capture real-world DNS variance, ISP/CDN latency, or anti-bot defences.
+The crawl experiments use a deterministic local website spread across multiple ports to simulate multiple domains. Workers still use the real Redis frontier, processing ledger, MongoDB transactions, S3 blob store, streaming indexer, PageRank worker, and search aggregation path. The local fixture makes the results reproducible, but it does not capture real-world DNS variance, ISP/CDN latency, or anti-bot defences.
 """
     (PROJECT_ROOT / 'results' / 'README.md').write_text(text, encoding='utf-8')
 

@@ -8,7 +8,7 @@ This document describes the current implementation of the distributed crawler an
 seed
   -> Redis frontier / Bloom / leases / politeness
   -> crawler-worker replicas
-  -> MinIO/S3 compressed HTML objects
+  -> S3 (SeaweedFS) compressed HTML objects
   -> MongoDB transactional page collections
   -> durable outboxes
   -> streaming-indexer replicas
@@ -22,7 +22,7 @@ seed
 | --- | --- |
 | `redis` | URL frontier, Bloom filter, in-flight URL leases, politeness locks, robots crawl-delay cache |
 | `mongodb` | Single-node replica set `rs0` for transactions and persistent crawler/index/PageRank state |
-| `minio` | S3-compatible shared object store for compressed HTML |
+| `s3` | SeaweedFS S3 gateway: shared object store for compressed HTML (MinIO stopped publishing images in 2025) |
 | `crawler-worker` | Fetches pages, extracts text/links, writes page data and outbox events |
 | `streaming-indexer` | Consumes `index_outbox` and updates search indexes |
 | `pagerank-worker` | Consumes `graph_outbox`, updates graph ledger, and propagates PageRank residuals |
@@ -76,9 +76,9 @@ MongoDB collections:
 Compressed HTML is not stored in MongoDB. It is written through a blob-store abstraction:
 
 - `LocalHtmlBlobStore`: local debugging fallback.
-- `S3HtmlBlobStore`: S3/MinIO distributed path.
+- `S3HtmlBlobStore`: S3 distributed path (AWS S3, SeaweedFS, or any S3-compatible store).
 
-For Docker Compose, `CRAWLER_CONTENT_STORE=s3` and `S3_ENDPOINT_URL=http://minio:9000` make every container read/write the same MinIO bucket.
+For Docker Compose, `CRAWLER_CONTENT_STORE=s3` and `S3_ENDPOINT_URL=http://s3:8333` make every container read/write the same bucket.
 
 Page writes use MongoDB transactions. The crawler writes metadata, content pointer, clean document, `index_outbox`, and `graph_outbox` in the same transaction. If the transaction fails, no outbox event is emitted for a page that was not saved.
 
@@ -148,7 +148,7 @@ Fresh bounded demo:
 
 ```bash
 docker compose down -v --remove-orphans
-docker compose up -d --build redis mongodb minio streaming-indexer pagerank-worker search-api
+docker compose up -d --build redis mongodb s3 streaming-indexer pagerank-worker search-api
 docker compose --profile tools run --rm seed
 docker compose run --rm crawler-worker python src/v3/worker_v3.py --worker-id demo-worker --max-pages 30 --idle-timeout 45 --batch-size 5
 docker compose exec -T streaming-indexer python streaming_indexer.py --once --max-events 1000
@@ -211,7 +211,7 @@ docker compose exec -T mongodb mongosh --quiet --eval "rs.status().members.map(m
 | PageRank worker dies after claiming event | Watchdog returns event to `pending` |
 | PageRank worker dies while pushing residual | Residual claim is reclaimed |
 | API receives common query term | MongoDB sorts/limits results before FastAPI receives them |
-| Worker writes raw HTML | Blob is stored in shared MinIO/S3, not per-machine disk |
+| Worker writes raw HTML | Blob is stored in shared S3, not per-machine disk |
 
 ## Known Limits
 
@@ -219,6 +219,6 @@ The Compose setup is suitable for local demos and application-level distributed 
 
 - Redis is a single container, not Sentinel or Cluster.
 - MongoDB is a single-node replica set for transactions, not a three-node HA replica set.
-- MinIO is single-node, not distributed MinIO.
+- The S3 store is a single SeaweedFS node, not a replicated cluster.
 
-For production machine-failure tolerance, deploy Redis Sentinel/Cluster, a multi-node MongoDB replica set, and distributed MinIO or real S3.
+For production machine-failure tolerance, deploy Redis Sentinel/Cluster, a multi-node MongoDB replica set, and a replicated SeaweedFS cluster or real S3.

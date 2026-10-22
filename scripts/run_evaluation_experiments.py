@@ -256,12 +256,12 @@ def env():
     base.setdefault('MONGO_DB', DATABASE_NAME)
     base.setdefault('RECOVERY_INTERVAL', '1')
     # Exercise the distributed blob-store path during host-side evaluation.
-    # The Compose MinIO service is published at localhost:9000.
+    # The Compose s3 (SeaweedFS) service is published at localhost:8333.
     base.setdefault('CRAWLER_CONTENT_STORE', 's3')
     base.setdefault('S3_BUCKET', 'crawler-html')
-    base.setdefault('S3_ENDPOINT_URL', 'http://localhost:9000')
-    base.setdefault('AWS_ACCESS_KEY_ID', 'minioadmin')
-    base.setdefault('AWS_SECRET_ACCESS_KEY', 'minioadmin')
+    base.setdefault('S3_ENDPOINT_URL', 'http://localhost:8333')
+    base.setdefault('AWS_ACCESS_KEY_ID', 'crawler')
+    base.setdefault('AWS_SECRET_ACCESS_KEY', 'crawler-secret')
     base.setdefault('AWS_REGION', 'us-east-1')
     return base
 

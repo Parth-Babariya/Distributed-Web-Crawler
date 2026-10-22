@@ -1,7 +1,7 @@
 # Distributed Web Crawler
 
 A Dockerized distributed web crawler with Redis coordination, MongoDB storage,
-MinIO/S3 HTML blob storage, streaming indexing, incremental PageRank, and a
+S3-compatible HTML blob storage (SeaweedFS locally), streaming indexing, incremental PageRank, and a
 FastAPI search API.
 
 The first section is the recommended automatic Docker flow: no manual index
@@ -13,7 +13,7 @@ drain, no manual PageRank drain, and no manual crawler stop.
 |---|---|---|
 | 1 | **Automatic Docker Run** | Runs the full system automatically with Docker. |
 | 2 | **Search Edge Cases** | Checks top-k search and unknown-term behavior. |
-| 3 | **Docker Desktop Inspection** | Checks containers, logs, MongoDB state, and MinIO state. |
+| 3 | **Docker Desktop Inspection** | Checks containers, logs, MongoDB state, and S3 blob state. |
 | 4 | **Automated Unit Tests** | Checks core logic correctness. |
 | 5 | **Automated Distributed Fault Test** | Checks worker-kill recovery and deterministic search correctness. |
 | 6 | **Optional Manual Fault Tests** | Extra failure checks when needed. |
@@ -28,7 +28,7 @@ Run it after the automatic Docker run, or run the Docker flow again afterward.
 |---|---|
 | `redis` | URL frontier, Bloom filter, crawl leases, domain locks, robots cache. |
 | `mongodb` | Durable database. Runs as replica set `rs0` so transactions work. |
-| `minio` | Shared S3-compatible object store for compressed raw HTML. |
+| `s3` | Shared S3-compatible object store for compressed raw HTML ([SeaweedFS](https://github.com/seaweedfs/seaweedfs); MinIO stopped publishing images in 2025). |
 | `crawler-worker` | Fetches pages, extracts text/links, writes page data and events. |
 | `streaming-indexer` | Automatically consumes index events and updates `term_postings`. |
 | `pagerank-worker` | Automatically consumes graph events and updates PageRank state. |
@@ -73,7 +73,7 @@ Copy-paste these commands in order:
 
 ```powershell
 docker compose down -v --remove-orphans
-docker compose up -d --build redis mongodb minio streaming-indexer pagerank-worker search-api
+docker compose up -d --build redis mongodb s3 streaming-indexer pagerank-worker search-api
 docker compose ps
 docker compose exec -T mongodb mongosh --quiet --eval "rs.status().members.map(m => m.name + ':' + m.stateStr).join(',')"
 docker compose --profile tools run --rm seed
@@ -106,12 +106,12 @@ The detailed explanation for each command is below.
 docker compose down -v --remove-orphans
 ```
 
-Why: removes old containers and old Redis/MongoDB/MinIO volumes.
+Why: removes old containers and old Redis/MongoDB/S3 volumes.
 
 ### Step 2: Start infrastructure, background processors, and API
 
 ```powershell
-docker compose up -d --build redis mongodb minio streaming-indexer pagerank-worker search-api
+docker compose up -d --build redis mongodb s3 streaming-indexer pagerank-worker search-api
 ```
 
 Why: starts the services that should be alive before crawling begins.
@@ -128,7 +128,7 @@ What is automatic now:
 docker compose ps
 ```
 
-Expected: `redis`, `mongodb`, `minio`, `streaming-indexer`,
+Expected: `redis`, `mongodb`, `s3`, `streaming-indexer`,
 `pagerank-worker`, and `search-api` are running/healthy.
 
 ### Step 4: Verify MongoDB replica set
@@ -265,7 +265,7 @@ Open Docker Desktop:
 3. Check running services:
    - `redis`
    - `mongodb`
-   - `minio`
+   - `s3`
    - `streaming-indexer`
    - `pagerank-worker`
    - `search-api`
@@ -277,19 +277,15 @@ Open Docker Desktop:
    bounded workers.
 6. Open logs for crawler/indexer/PageRank to inspect processing.
 
-MinIO console:
+S3 blob store (SeaweedFS filer UI):
 
 ```text
-http://localhost:9001
-username: minioadmin
-password: minioadmin
+http://localhost:8888/buckets/crawler-html/
 ```
 
-Check bucket:
-
-```text
-crawler-html
-```
+The S3 API itself is at `http://localhost:8333` with access key `crawler` and
+secret `crawler-secret` (configured in `docker/seaweedfs/s3.json`). Blobs live
+in bucket `crawler-html` under `html/<2 hex>/<2 hex>/<sha256>.zlib`.
 
 This proves raw HTML is stored in shared object storage, not on a worker's
 local disk.
@@ -300,7 +296,7 @@ local disk.
 2. `crawler-worker` containers pull URLs from Redis.
 3. Workers check robots.txt and domain politeness locks.
 4. Workers download HTML and extract clean text plus outbound links.
-5. Compressed raw HTML goes to MinIO.
+5. Compressed raw HTML goes to the S3 store.
 6. MongoDB stores metadata, clean text, content pointers, and durable events.
 7. `streaming-indexer` automatically consumes index events and writes
    `term_postings`.
@@ -363,7 +359,7 @@ datastores.
 Make sure backing services are up:
 
 ```powershell
-docker compose up -d redis mongodb minio
+docker compose up -d redis mongodb s3
 ```
 
 Run:
@@ -546,7 +542,7 @@ python -m pip install -r requirements.txt
 Start backing services:
 
 ```powershell
-docker compose up -d redis mongodb minio
+docker compose up -d redis mongodb s3
 ```
 
 Run experiments:
@@ -631,14 +627,14 @@ Full reset:
 
 ```powershell
 docker compose down -v --remove-orphans
-docker compose up -d --build redis mongodb minio streaming-indexer pagerank-worker search-api
+docker compose up -d --build redis mongodb s3 streaming-indexer pagerank-worker search-api
 ```
 
 ## Notes
 
 - Docker Compose runs multiple application containers on one Docker host.
-- This is not a multi-machine Redis/MongoDB/MinIO production cluster.
+- This is not a multi-machine Redis/MongoDB/S3 production cluster.
 - Production HA would need Redis Sentinel/Cluster, a multi-node MongoDB replica
-  set, and distributed MinIO or real S3.
+  set, and a replicated SeaweedFS cluster or real S3.
 - The crawler handles static HTML and does not execute JavaScript.
 - Public websites may block crawlers, so live internet result counts can vary.

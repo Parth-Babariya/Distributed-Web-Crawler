@@ -31,9 +31,8 @@ Thumbs.db
 docker-compose.override.yml
 **/tmp/
 
-# Local HTML blob store and MinIO data
+# Local HTML blob store
 content_store/
-minio-data/
 
 # Results, reports and generated outputs (fully regenerable)
 results/

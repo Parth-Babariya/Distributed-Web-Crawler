@@ -8,12 +8,12 @@ The current implementation is Dockerized end to end for a local distributed demo
 - Redis frontier, Bloom filter, processing leases, and politeness locks use atomic server-side operations where correctness requires it.
 - MongoDB runs as a replica set and supports multi-document transactions.
 - Page writes emit `index_outbox` and `graph_outbox` events in the same transaction as the page data.
-- Raw compressed HTML is stored in MinIO/S3 through `S3HtmlBlobStore`; MongoDB stores only object pointers.
+- Raw compressed HTML is stored in S3 (SeaweedFS in Compose) through `S3HtmlBlobStore`; MongoDB stores only object pointers.
 - Streaming indexer consumes `index_outbox` and updates `term_postings` and `indexed_documents`.
 - Incremental PageRank worker consumes `graph_outbox`, updates `graph_edges`, and maintains `pagerank_nodes`.
 - Search API ranks with BM25 plus damped PageRank inside a MongoDB aggregation, and sorts/limits there before returning data to FastAPI.
 - Crawler workers keep several fetches in flight (one per domain) and drop permanently failing URLs (4xx, non-HTML, oversized) instead of retrying them.
-- Docker Compose includes Redis, MongoDB, MinIO, crawler workers, streaming indexer, PageRank worker, search API, and seed helper.
+- Docker Compose includes Redis, MongoDB, an S3 store (SeaweedFS), crawler workers, streaming indexer, PageRank worker, search API, and seed helper.
 
 ## Primary Demo Commands
 
@@ -21,7 +21,7 @@ Fresh bounded demo:
 
 ```bash
 docker compose down -v --remove-orphans
-docker compose up -d --build redis mongodb minio streaming-indexer pagerank-worker search-api
+docker compose up -d --build redis mongodb s3 streaming-indexer pagerank-worker search-api
 docker compose --profile tools run --rm seed
 docker compose run --rm crawler-worker python src/v3/worker_v3.py --worker-id demo-worker --max-pages 30 --idle-timeout 45 --batch-size 5
 docker compose exec -T streaming-indexer python streaming_indexer.py --once --max-events 1000
@@ -53,7 +53,7 @@ Runtime checks previously passed with:
 ```text
 redis: healthy
 mongodb: healthy, mongodb:27017:PRIMARY
-minio: healthy
+s3: healthy
 crawler-worker: running
 streaming-indexer: running
 pagerank-worker: running
@@ -66,6 +66,6 @@ The Compose stack provides application-level fault tolerance for local demos, bu
 
 - Redis is not Sentinel/Cluster.
 - MongoDB is a single-node replica set, not a three-node HA replica set.
-- MinIO is single-node, not distributed MinIO.
+- The S3 store is a single SeaweedFS node, not a replicated cluster.
 
 For production machine-failure tolerance, deploy HA versions of those backing services.

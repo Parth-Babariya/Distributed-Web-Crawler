@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "crawler",
+      "credentials": [
+        {
+          "accessKey": "crawler",
+          "secretKey": "crawler-secret"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
