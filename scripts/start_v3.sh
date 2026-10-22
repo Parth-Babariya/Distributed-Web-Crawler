@@ -59,16 +59,20 @@ if ! python3 -c "import mmh3" > /dev/null 2>&1; then
 fi
 echo "✅ Dependencies OK"
 
-# Seed URLs (if frontier empty)
-FRONTIER_SIZE=$(redis-cli ZCARD crawler:frontier)
-if [ "$FRONTIER_SIZE" -eq 0 ]; then
+# Seed URLs (if frontier empty). The frontier is one ZSET per domain
+# (crawler:frontier:<domain>), so count those keys.
+frontier_domains() {
+    redis-cli --scan --pattern 'crawler:frontier:*' | wc -l
+}
+FRONTIER_DOMAINS=$(frontier_domains)
+if [ "$FRONTIER_DOMAINS" -eq 0 ]; then
     echo ""
     echo "🌱 Seeding URLs..."
     python3 "$PROJECT_ROOT/src/v3/master_v3.py" seed $SEED_URLS
-    echo "✅ Seeded $(redis-cli ZCARD crawler:frontier) URLs"
+    echo "✅ Frontier now has queued URLs for $(frontier_domains) domains"
 else
     echo ""
-    echo "ℹ️  Frontier already has $FRONTIER_SIZE URLs (skipping seed)"
+    echo "ℹ️  Frontier already has queued URLs for $FRONTIER_DOMAINS domains (skipping seed)"
 fi
 
 # Start workers

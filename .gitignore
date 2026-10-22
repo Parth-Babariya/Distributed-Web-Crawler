@@ -2,27 +2,27 @@
 __pycache__/
 *.py[cod]
 *$py.class
+pip-wheel-metadata/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
 .venv/
 venv/
 env/
 ENV/
-pip-wheel-metadata/
-build/
-dist/
+
+# Secrets / env files
+.env
+*.env
 
 # Editor and OS
 .vscode/
 .idea/
 .DS_Store
-
-# Virtual environment
-.env
-
-# Pytest
-.pytest_cache/
-
-# Mypy
-.mypy_cache/
+Thumbs.db
 
 # Logs
 *.log
@@ -31,56 +31,23 @@ dist/
 docker-compose.override.yml
 **/tmp/
 
-# Results, reports and generated outputs
-results/
-report/generated_results.tex
-report/main.pdf
-report/figures/
-results/processed/
-results/raw/
-
-# MinIO local data
+# Local HTML blob store and MinIO data
+content_store/
 minio-data/
 
-# Ignore specific PDF that should not be pushed
-Distributed Web Crawler Project.pdf
-# Python bytecode
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Pytest
-.pytest_cache/
-
-# Raw experiment logs & outputs (hundreds of files, fully regenerable)
-results/raw/
-results/figures/
+# Results, reports and generated outputs (fully regenerable)
+results/
+report/generated_results.tex
+report/figures/
+report/main.pdf
+report/presentation.pdf
 
 # LaTeX build artifacts
 report/*.aux
 report/*.fdb_latexmk
 report/*.fls
-report/*.log
 report/*.out
 report/*.toc
-report/texput.log
-report/main.pdf
 
-# Python virtual environment (if you ever add one)
-venv/
-.venv/
-env/
-
-# OS junk
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Secrets / env files
-.env
-*.env
-# Compiled presentation (build from report/presentation.tex)
-report/presentation.pdf
+# Project PDF that should not be pushed
+Distributed Web Crawler Project.pdf

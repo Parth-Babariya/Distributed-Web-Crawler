@@ -64,7 +64,7 @@ frontier becomes idle.
 Run every command from the project root:
 
 ```powershell
-cd C:\Users\Asus\Desktop\Distributed-Web-Crawler-main\Distributed-Web-Crawler-main
+cd Distributed-Web-Crawler
 ```
 
 ### Quick command list
@@ -325,6 +325,14 @@ logic check.
 
 ```powershell
 python -m unittest tests.test_core_unit
+```
+
+With MongoDB running (`docker compose up -d mongodb`), also run the
+Mongo-backed checks for PageRank consistency and BM25 ranking. They are
+skipped automatically when MongoDB is not reachable:
+
+```powershell
+python -m unittest tests.test_pagerank_consistency tests.test_search_ranking
 ```
 
 Checks core logic such as Bloom/frontier behavior, parsing helpers, and

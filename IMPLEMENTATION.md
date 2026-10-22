@@ -96,9 +96,10 @@ Workers claim with `find_one_and_update`, setting `worker_id` and `claimed_at`. 
 
 Index state:
 
-- `term_postings`: normalized postings, one document per `(term, url)`.
-- `inverted_index`: legacy compatible term document with embedded postings.
-- `indexed_documents`: per-URL term-count state used to remove stale postings on recrawl.
+- `term_postings`: normalized postings, one document per `(term, url)`, carrying `term_frequency`, `doc_length` and an `in_title` flag for BM25.
+- `indexed_documents`: per-URL term-count state used to remove stale postings on recrawl, plus `doc_length` for corpus statistics.
+
+The legacy embedded-postings `inverted_index` collection is no longer written: per-term documents hit MongoDB's 16MB limit on common terms.
 
 Tokenization and stemming live in `src/indexer/mapreduce_indexer.py` and are shared by indexing and search.
 
@@ -112,6 +113,8 @@ State collections:
 - `pagerank_nodes`: rank and residual per URL.
 
 The worker calculates contribution deltas from edge changes, adds residuals to affected nodes, and pushes residuals through successors until below the configured threshold.
+
+Ranks use the unnormalized equation `x = (1-d)·t + d·Aᵀx`: each node (or each seed URL, with `--seed-url`) carries teleport mass `1-d`, and dangling nodes route their rank to the seeds or drop it. A new node starts at rank 0 with residual `(1-d)·t`, so every update touches only the nodes it changes — no O(N) personalization vector. A page nobody links to has rank `1-d`. `--recompute` solves the same equation, so incremental and batch ranks agree (checked by `tests/test_pagerank_consistency.py`).
 
 Fault-tolerant lifecycle:
 
@@ -130,12 +133,12 @@ docker compose run --rm pagerank-worker python pagerank_worker.py --recompute
 
 Search uses the same tokenizer/stemmer as the indexer. Ranking is performed inside MongoDB aggregation:
 
-1. Match query terms in `term_postings`.
-2. Group by URL and sum term frequency.
-3. Lookup PageRank from `pagerank_nodes`.
-4. Compute blended score.
-5. Sort and limit in MongoDB.
-6. Fetch snippets only for final top URLs.
+1. Count each term's document frequency and read corpus statistics (document count, average length) from `indexed_documents`, cached for 30s.
+2. Match query terms in `term_postings` and score each posting with Okapi BM25 (`k1=1.2`, `b=0.75`), x1.5 for title matches.
+3. Group by URL and sum; with `mode=all`, keep only URLs that matched every term.
+4. Keep the best `10 x limit` (at least 100) candidates by BM25.
+5. Lookup PageRank for those candidates only and score `bm25 * (1 + 0.5 * ln(1 + rank / (1-d)))`.
+6. Sort and limit in MongoDB, then fetch snippets only for final top URLs.
 
 This avoids loading huge postings lists into FastAPI memory.
 

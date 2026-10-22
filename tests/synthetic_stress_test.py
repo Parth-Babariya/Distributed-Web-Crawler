@@ -169,7 +169,10 @@ class SyntheticStressTest:
 
         pages_stored = self.db.pages_metadata.count_documents({})
         documents_stored = self.db.pages_documents.count_documents({})
-        frontier_size = self.redis.zcard('crawler:frontier')
+        frontier_size = sum(
+            self.redis.zcard(key)
+            for key in self.redis.scan_iter(match='crawler:frontier:*', count=200)
+        )
         processing_size = self.redis.hlen('crawler:processing')
         redis_memory_mb = self.redis.info('memory')['used_memory'] / (1024 * 1024)
 

@@ -9,9 +9,10 @@ The current implementation is Dockerized end to end for a local distributed demo
 - MongoDB runs as a replica set and supports multi-document transactions.
 - Page writes emit `index_outbox` and `graph_outbox` events in the same transaction as the page data.
 - Raw compressed HTML is stored in MinIO/S3 through `S3HtmlBlobStore`; MongoDB stores only object pointers.
-- Streaming indexer consumes `index_outbox` and updates `term_postings`, `inverted_index`, and `indexed_documents`.
+- Streaming indexer consumes `index_outbox` and updates `term_postings` and `indexed_documents`.
 - Incremental PageRank worker consumes `graph_outbox`, updates `graph_edges`, and maintains `pagerank_nodes`.
-- Search API uses MongoDB aggregation to sort and limit results before returning data to FastAPI.
+- Search API ranks with BM25 plus damped PageRank inside a MongoDB aggregation, and sorts/limits there before returning data to FastAPI.
+- Crawler workers keep several fetches in flight (one per domain) and drop permanently failing URLs (4xx, non-HTML, oversized) instead of retrying them.
 - Docker Compose includes Redis, MongoDB, MinIO, crawler workers, streaming indexer, PageRank worker, search API, and seed helper.
 
 ## Primary Demo Commands

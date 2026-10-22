@@ -1,8 +1,6 @@
 #!/bin/bash
-"""
-Complete cleanup script - Wipes MongoDB AND Redis.
-Use this before starting a fresh crawl with new seed URLs.
-"""
+# Complete cleanup script - Wipes MongoDB AND Redis.
+# Use this before starting a fresh crawl with new seed URLs.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -24,24 +22,17 @@ python3 "$PROJECT_ROOT/src/utils/cleanup_mongodb.py" --confirm
 # Clean Redis
 echo ""
 echo "🗑️  Cleaning Redis..."
-echo "   Deleting crawler:frontier..."
-redis-cli DEL crawler:frontier > /dev/null
-
-echo "   Deleting crawler:bloom_filter..."
-redis-cli DEL crawler:bloom_filter > /dev/null
-
-echo "   Deleting robots.txt cache..."
-redis-cli --scan --pattern "robots_cache:*" | xargs -L 100 redis-cli DEL > /dev/null 2>&1
-
-echo "   Deleting domain metadata..."
-redis-cli --scan --pattern "domain:*" | xargs -L 100 redis-cli DEL > /dev/null 2>&1
-
-echo "   Deleting domain locks..."
-redis-cli --scan --pattern "lock:*" | xargs -L 100 redis-cli DEL > /dev/null 2>&1
+# crawler:* covers the per-domain frontier ZSETs, active_domains,
+# domain_known, the Bloom filter and the processing index; leases, locks and
+# the robots cache live outside that namespace.
+for pattern in "crawler:*" "processing_lease:*" "lock:*" "robots_cache:*"; do
+    echo "   Deleting $pattern..."
+    redis-cli --scan --pattern "$pattern" | xargs -L 100 redis-cli DEL > /dev/null 2>&1
+done
 
 # Verify cleanup
-FRONTIER_COUNT=$(redis-cli ZCARD crawler:frontier)
-BLOOM_EXISTS=$(redis-cli EXISTS crawler:bloom_filter)
+FRONTIER_COUNT=$(redis-cli --scan --pattern 'crawler:frontier:*' | wc -l)
+BLOOM_EXISTS=$(redis-cli EXISTS crawler:bloom)
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -50,7 +41,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "Status:"
 echo "  ✅ MongoDB: Cleaned"
-echo "  ✅ Redis frontier: $FRONTIER_COUNT URLs (should be 0)"
+echo "  ✅ Redis frontier: $FRONTIER_COUNT domain queues (should be 0)"
 echo "  ✅ Redis Bloom Filter: $([ $BLOOM_EXISTS -eq 0 ] && echo 'Deleted' || echo 'Still exists')"
 echo ""
 echo "Ready for fresh crawl! Run:"
