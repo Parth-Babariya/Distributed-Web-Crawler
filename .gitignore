@@ -82,3 +82,5 @@ Thumbs.db
 # Secrets / env files
 .env
 *.env
+# Compiled presentation (build from report/presentation.tex)
+report/presentation.pdf
